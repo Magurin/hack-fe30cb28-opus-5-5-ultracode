@@ -398,12 +398,17 @@ sys.argv = ["harness/_train.py"] + sys.argv[1:]
 runpy.run_path("harness/_train.py", run_name="__main__")
 ```
 
+Конфиг делаем напрямую из `task/task.yaml`, как `run_task.py`, но без прогона базы: базе нужно
+~14 ГБ, на картах с 8-12 ГБ она упадёт с OOM.
+
 ```bash
-python harness/run_task.py --repeats 1      # один раз: создаёт runs/<прогон>/task.yaml
-python fp16_path.py --config runs/solution_1/task.yaml --metrics m.json --solution
+python task/prepare_data.py
+python -c "import os, yaml; c = yaml.safe_load(open('task/task.yaml')); c['data']['train'] = 'data/train.jsonl'; c['output'] = 'runs/local/adapter'; os.makedirs('runs/local', exist_ok=True); yaml.safe_dump(c, open('runs/local/task.yaml', 'w'))"
+python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.json --solution
 ```
 
-Так мы получали локальные цифры на RTX 4060; засчитываемые замеры - только T4.
+Проверено на RTX 4060 (8 ГБ): шаг ставится, 64 шага, пик 1 152 MiB. Засчитываемые замеры - только
+на T4.
 
 ### Регуляторы (`solution/patch.py`)
 
