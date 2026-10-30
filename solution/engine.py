@@ -214,16 +214,24 @@ def dequant(weights, device):
 # ---------------------------------------------------------------------------------------------
 # Per-step packing
 # ---------------------------------------------------------------------------------------------
+class UnsupportedBatch(ValueError):
+    """The fused step does not take this batch; raised before the step changes anything, so the
+    caller can run the original code instead."""
+
+
 class Packed:
     """One micro-batch without its padding: real tokens of every row, back to back."""
 
     def __init__(self, input_ids, attention_mask, labels, rope, dropout_rng, dropout_p):
+        if input_ids.dim() != 2 or attention_mask.shape != input_ids.shape \
+                or labels.shape != input_ids.shape:
+            raise UnsupportedBatch("inputs are not [rows, tokens]")
         B, T = input_ids.shape
         lengths = attention_mask.sum(dim=1)
         lengths_cpu = lengths.tolist()
         expected = torch.arange(T, device=input_ids.device)[None, :] < lengths[:, None]
         if not bool(torch.equal(attention_mask.bool(), expected)):
-            raise ValueError("attention_mask is not right-padded")
+            raise UnsupportedBatch("attention_mask is not right-padded")
         flat = expected.reshape(-1).nonzero().squeeze(1)
         self.n = int(flat.numel())
         self.rows = B
@@ -684,7 +692,8 @@ class _Head(torch.autograd.Function):
         dh.index_copy_(0, order, dhp)
         del dhp, hp
         ctx.save_for_backward(dh)
-        stats.order, stats.tok_loss, stats.entropy, stats.correct = order, tok_loss, entropy,             correct
+        stats.order, stats.tok_loss = order, tok_loss
+        stats.entropy, stats.correct = entropy, correct
         return tok_loss.sum() * inv
 
     @staticmethod

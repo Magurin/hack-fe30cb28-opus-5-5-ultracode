@@ -176,9 +176,11 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         and self.label_smoother is None
     )
     if not usable:
+        if engine is not None:  # the original code runs the 4-bit layers: weights back on the GPU
+            engine.restore_weights()
         return original(model, inputs, return_outputs=return_outputs,
                         num_items_in_batch=num_items_in_batch)
-    inputs.pop("_prediction_loss_only", None)
+    popped = {key: inputs.pop(key) for key in ("_prediction_loss_only",) if key in inputs}
     input_ids, attention_mask, labels = (inputs["input_ids"], inputs["attention_mask"],
                                          inputs["labels"])
 
@@ -191,7 +193,15 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
     denom = float(denom.item() if torch.is_tensor(denom) else denom)
     if OFFLOAD_WEIGHTS:
         engine.offload_weights()  # first step: move the NF4 layer weights to pinned host memory
-    loss, packed, stats = engine.step(input_ids, attention_mask, labels, denom)
+    from .engine import UnsupportedBatch
+
+    try:
+        loss, packed, stats = engine.step(input_ids, attention_mask, labels, denom)
+    except UnsupportedBatch:  # e.g. left padding: raised before the step changed anything
+        engine.restore_weights()
+        inputs.update(popped)
+        return original(model, inputs, return_outputs=return_outputs,
+                        num_items_in_batch=num_items_in_batch)
     if self.args.average_tokens_across_devices and self.model_accepts_loss_kwargs \
             and num_items_in_batch is not None:
         scale = self.accelerator.num_processes
