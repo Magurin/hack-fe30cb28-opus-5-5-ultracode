@@ -33,6 +33,7 @@ NF4_ROWS = 32  # quantization blocks (of 64 values) per program
 GLU_BLOCK = 1024
 CE_BLOCK = 4096
 HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
+MLP_CHUNK = 512  # tokens of [gate | up] alive at a time in a lean step (FusedQwen2.keep_plan)
 
 
 _COMPILE_ONLY = threading.local()  # set by solution/warmup.py in its compile threads
@@ -329,6 +330,8 @@ class Packed:
         self.lora16_views = None  # per layer: fp16 copies of its LoRA weights (FusedQwen2.step)
         self.keep_gu_from = 1 << 30  # layers from this index on keep [gate | up] for backward
         self.keep_all_from = 1 << 30  # ... and from this one every intermediate
+        self.lean = False  # recompute and run the MLP in parts (FusedQwen2.keep_plan)
+        self.mlp_chunk = MLP_CHUNK
 
     def lora16(self, index, weights):
         if self.lora16_views is not None:
@@ -380,15 +383,15 @@ def _attn_bwd(dout, q, k, v, out, lse, seed, offset, packed, scale):
     return dq[0], dk[0], dv[0]
 
 
-def _split_k_mm(a, b, parts):
+def _split_k_mm(a, b, parts, out=None):
     """a @ b as `parts` accumulated GEMMs over slices of K. For the [tokens, 17920] x
     [17920, 1536] backward GEMM through the fused gate/up weight, cuBLAS on a T4 picks a
     slower kernel for the single long-K call (1.93 ms) than for four K=4480 ones (1.70 ms)."""
     k = a.shape[1]
     step = k // parts
     if k % parts or step % 64:
-        return a @ b
-    out = a[:, :step] @ b[:step]
+        return torch.mm(a, b, out=out)
+    out = torch.mm(a[:, :step], b[:step], out=out)
     for i in range(1, parts):
         out.addmm_(a[:, i * step:(i + 1) * step], b[i * step:(i + 1) * step])
     return out
@@ -529,9 +532,9 @@ def _rope_bwd(spec, dq, dk, dv, packed):
     return dqkv
 
 
-def _glu_fwd(gu, I):
+def _glu_fwd(gu, I, out=None):
     n = gu.shape[0]
-    m = torch.empty((n, I), device=gu.device, dtype=torch.float16)
+    m = out if out is not None else torch.empty((n, I), device=gu.device, dtype=torch.float16)
     if n:
         _launch(K.glu_fwd_kernel, (n, _cdiv(I, GLU_BLOCK)), gu, m, I, BLOCK=GLU_BLOCK)
     return m
@@ -550,11 +553,17 @@ def _ce(logits, targets, tok_loss, entropy, correct, zero_unsupervised=True):
                 int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
 
 
-def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False, full=False):
+def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False, full=False,
+                   part=None):
     """One decoder layer forward. With keep=True (the backward's recomputation) returns what the
     backward reads, dequantized weights included; a `gu` kept from the forward replaces the
     gate/up GEMM. Otherwise returns h3 and, with return_gu, the [gate | up] GEMM output, or with
-    full, every intermediate the backward reads (without the weights)."""
+    full, every intermediate the backward reads (without the weights).
+
+    A lean step (packed.lean) recomputes in two parts, so the attention intermediates and the
+    [gate | up] output never coexist: part="mlp_input" returns the residual after attention, its
+    rstd and the MLP input b; part="attention" returns what the attention and LoRA backward read.
+    Its forward runs the MLP over MLP_CHUNK tokens at a time."""
     n, H = h.shape
     D, HQ, HKV = spec.D, spec.HQ, spec.HKV
     group = HQ // HKV
@@ -585,6 +594,13 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     del qkv, lq, lv
     k_e, v_e = k, v
     out, lse, aseed, aoffset = _attn_fwd(q, k_e, v_e, packed, spec.scale)
+    if part == "attention":
+        saved.update(rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e, out=out,
+                     lse=lse, aseed=aseed, aoffset=aoffset)
+        return None, saved
+    if part == "mlp_input":
+        saved.pop("w_qkv", None)
+        del aq, av, xq, xv, q, k, v, k_e, v_e, lse
 
     w = dequant([spec.w["o_proj"]], dev)
     o = out.reshape(n, HQ * D) @ w.t()
@@ -593,7 +609,21 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     del w
     h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
     del o
+    if part == "mlp_input":
+        return None, {"h2": h2, "rstd2": rstd2, "b": b}
     w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
+    if packed.lean and not keep and gu is None and not full and not return_gu:
+        # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time
+        del aq, av, q, k, v, k_e, v_e, out, lse
+        m = torch.empty((n, spec.I), device=dev, dtype=torch.float16)
+        for c0 in range(0, n, packed.mlp_chunk):
+            c1 = min(n, c0 + packed.mlp_chunk)
+            _glu_fwd(b[c0:c1] @ w.t(), spec.I, out=m[c0:c1])
+        del w, b
+        w = dequant([spec.w["down_proj"]], dev)
+        d = m @ w.t()
+        del w, m
+        return torch.add(h2, d), None
     if gu is None:
         gu = b @ w.t()
     del b
@@ -661,24 +691,47 @@ class _Layer(torch.autograd.Function):
         w = dequant([spec.w["down_proj"]], dev)
         dm = dh3.to(torch.float16) @ w
         del w
-        if ctx.kept_all is not None:  # nothing to recompute; the weights are dequantized below
-            f, ctx.kept_all = ctx.kept_all, None
-        else:
+        if packed.lean:
+            # recompute up to the MLP input only, go back through the MLP a chunk of tokens at a
+            # time, then recompute the attention for its backward
             with torch.no_grad():
-                _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=ctx.kept_gu)
-            ctx.kept_gu = None
+                _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True,
+                                      part="mlp_input")
+            b = f.pop("b")
+            w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
+            db = torch.empty((n, H), device=dev, dtype=torch.float16)
+            for c0 in range(0, n, packed.mlp_chunk):
+                c1 = min(n, c0 + packed.mlp_chunk)
+                gu = b[c0:c1] @ w.t()
+                _glu_bwd(dm[c0:c1], gu, spec.I)
+                _split_k_mm(gu, w, 4, out=db[c0:c1])
+                del gu
+            del w, b, dm
+            dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
+            del db, dh3
+            with torch.no_grad():
+                _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True,
+                                      part="attention")
+        else:
+            if ctx.kept_all is not None:  # nothing to recompute; weights dequantized below
+                f, ctx.kept_all = ctx.kept_all, None
+            else:
+                with torch.no_grad():
+                    _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True,
+                                          gu=ctx.kept_gu)
+                ctx.kept_gu = None
 
-        # MLP
-        gu = f.pop("gu")
-        _glu_bwd(dm, gu, spec.I)
-        del dm
-        w = f.pop("w_gu") if "w_gu" in f else dequant([spec.w["gate_proj"], spec.w["up_proj"]],
-                                                       dev)
-        db = _split_k_mm(gu, w, 4)
-        del w
-        del gu
-        dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
-        del db, dh3
+            # MLP
+            gu = f.pop("gu")
+            _glu_bwd(dm, gu, spec.I)
+            del dm
+            w = f.pop("w_gu") if "w_gu" in f else dequant(
+                [spec.w["gate_proj"], spec.w["up_proj"]], dev)
+            db = _split_k_mm(gu, w, 4)
+            del w
+            del gu
+            dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
+            del db, dh3
 
         # attention
         w = f.pop("w_o") if "w_o" in f else dequant([spec.w["o_proj"]], dev)
@@ -807,6 +860,7 @@ class FusedQwen2:
         self.lm_w = causal.lm_head.weight
         self.rope = RopeTable(inner.rotary_emb, self.layers[0].D, self.device)
         self.rng = random.Random(seed)
+        self.mlp_chunk = MLP_CHUNK
         # One fp16 buffer for every LoRA weight: refreshed by a single foreach copy per step
         # instead of four casts per layer in forward and again in backward.
         self.lora_fp32, shapes = [], []
@@ -862,6 +916,15 @@ class FusedQwen2:
         weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 2 * I)
         return (torch.cuda.memory_allocated(self.device) + weights + 48 * 2**20
                 + n * (L * H * 4 + 64 * 1024))
+
+    def lean(self, n):
+        """Whether a step of n tokens needs the lean recomputation to stay under the cap: on the
+        longest batches (4 x 512 tokens) the plain step's peak (inputs of every layer plus one
+        layer's [gate | up] output and dm) would go above the model-load peak. A lean step keeps
+        nothing and recomputes in two parts (_layer_forward), with [gate | up] alive for
+        MLP_CHUNK tokens at a time: ~205 KiB per token instead of ~250."""
+        cap = getattr(self, "memory_cap", None)
+        return bool(cap) and n > self.mlp_chunk and self._predicted_peak(n) > cap
 
     def layers_to_keep(self, n):
         """How many layers can keep their [gate | up] output (2 * I fp16 values per token) instead
@@ -924,6 +987,8 @@ class FusedQwen2:
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = len(self.layers) - k_gu
         packed.keep_all_from = len(self.layers) - k_all
+        packed.mlp_chunk = self.mlp_chunk
+        packed.lean = k_gu == 0 and self.lean(packed.n)
         h = torch.nn.functional.embedding(packed.ids, self.embed).float()
         for spec in self.layers:
             h = _Layer.apply(h, spec, packed, *spec.lora_params())

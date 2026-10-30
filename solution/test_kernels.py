@@ -404,3 +404,39 @@ def test_keeping_everything_is_exact(tmp_path):
     loss_b, grads_b = run(1 << 40)
     assert torch.equal(loss_a, loss_b)
     assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
+def test_lean_step_matches(tmp_path):
+    """A lean step (the longest batches: recomputation in two parts, the MLP over chunks of
+    tokens) gives the same loss and gradients as the plain step, up to the GEMM split."""
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    torch.manual_seed(6)
+    ids = torch.randint(0, 3000, (3, 45), device=DEV)
+    mask = torch.ones_like(ids)
+    mask[1, 30:] = 0
+    labels = torch.where(mask.bool(), ids, -100)
+    labels[:, :5] = -100
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(lean):
+        engine = FusedQwen2(model, seed=4)
+        engine.offload_weights()
+        if lean:
+            engine.mlp_chunk = 16
+            engine.set_memory_cap(1)  # nothing fits: no keeping, lean
+            assert engine.lean(120) and engine.keep_plan(120) == (0, 0)
+        loss, packed, stats = engine.step(ids, mask, labels, 100.0)
+        assert packed.lean == lean
+        grads = torch.autograd.grad(loss, params)
+        engine.restore_weights()
+        return loss, grads, stats.entropy
+
+    loss_a, grads_a, ent_a = run(False)
+    loss_b, grads_b, ent_b = run(True)
+    assert torch.allclose(loss_a, loss_b, rtol=1e-4, atol=0)
+    assert torch.allclose(ent_a, ent_b, rtol=1e-3, atol=1e-4)
+    for a, b in zip(grads_a, grads_b):
+        assert ((a.float() - b.float()).norm() / a.float().norm().clamp(min=1e-12)) < 1e-3
