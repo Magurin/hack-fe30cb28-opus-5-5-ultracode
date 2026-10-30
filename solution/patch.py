@@ -273,6 +273,53 @@ class _FlushMetrics(_restore_callback_base()):
         _flush_metrics(self.trainer)
 
 
+class _Parameters:
+    """Stands in for a model where only its parameters() are read."""
+
+    def __init__(self, params):
+        self.params = params
+
+    def parameters(self):
+        return iter(self.params)
+
+
+def _walk_parameters_once(trainer):
+    """HF Trainer walks the whole model (~1 000 modules, ~700 parameters, nearly all frozen
+    4-bit ones) three times every step, between the backward and the next forward, while the GPU
+    has nothing to do: num_parameters() for the FLOP count it logs, model.parameters() for
+    gradient clipping, and zero_grad(). The parameters do not change while training, so these
+    go over a list taken on the first call instead: the same parameters in the same order,
+    handed to the same HF / torch code, the same results."""
+    model = trainer.model
+    counts = {}
+    num_parameters = model.num_parameters
+
+    def counted(only_trainable=False, exclude_embeddings=False):
+        key = (only_trainable, exclude_embeddings)
+        if key not in counts:
+            counts[key] = num_parameters(only_trainable=only_trainable,
+                                         exclude_embeddings=exclude_embeddings)
+        return counts[key]
+
+    lists = {}
+
+    def parameters_of(module):
+        if id(module) not in lists:
+            lists[id(module)] = (module, _Parameters(list(module.parameters())))
+        return lists[id(module)][1]
+
+    clip, get_norm = trainer._clip_grad_norm, trainer._get_grad_norm
+
+    def zero_grad(set_to_none=True):
+        torch.nn.Module.zero_grad(parameters_of(model), set_to_none)
+
+    model.num_parameters = counted
+    model.zero_grad = zero_grad
+    trainer._clip_grad_norm = lambda module: clip(parameters_of(module))
+    trainer._get_grad_norm = lambda module, grad_norm=None: get_norm(parameters_of(module),
+                                                                     grad_norm=grad_norm)
+
+
 def install(trainer, seed=0):
     model = getattr(trainer, "model", None)
     if getattr(trainer, _INSTALLED_ATTR, None) is not None:
@@ -302,6 +349,7 @@ def install(trainer, seed=0):
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
     trainer.add_callback(_RestoreWeights(engine))
     trainer.add_callback(_FlushMetrics(trainer))
+    _walk_parameters_once(trainer)
     mib = 2**20
     _log(f"fused Qwen2 step installed ({len(engine.layers)} layers, LoRA dropout "
          f"{engine.dropout_p}, embedding in fp16: {fp16_embedding}); CUDA memory before "
