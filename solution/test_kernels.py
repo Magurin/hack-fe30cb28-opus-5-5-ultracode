@@ -438,5 +438,8 @@ def test_lean_step_matches(tmp_path):
     loss_b, grads_b, ent_b = run(True)
     assert torch.allclose(loss_a, loss_b, rtol=1e-4, atol=0)
     assert torch.allclose(ent_a, ent_b, rtol=1e-3, atol=1e-4)
+    # The lean step splits the MLP GEMMs over 512-token chunks, so cuBLAS sums in another order
+    # (other kernels on a T4): a LoRA gradient moves by fp16 rounding, measured up to 2.7e-3 on
+    # a T4. The step-vs-HF test above allows 2e-2 for the same reason.
     for a, b in zip(grads_a, grads_b):
-        assert ((a.float() - b.float()).norm() / a.float().norm().clamp(min=1e-12)) < 1e-3
+        assert ((a.float() - b.float()).norm() / a.float().norm().clamp(min=1e-12)) < 1e-2
