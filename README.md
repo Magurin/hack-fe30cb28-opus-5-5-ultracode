@@ -33,7 +33,8 @@ Triton-кернелов: без паддинга, без fp32-копий акт�
 
 `solution.apply()` вызывается harness до сборки модели. Он ставит патчи (`solution/patch.py`), и
 в начале `SFTTrainerWrapper.train` подменяет `compute_loss` тренера на наш слитый шаг
-(`solution/engine.py`), если модель распознана (Qwen2 + bitsandbytes NF4 + LoRA на q/v). Тренер HF,
+(`solution/engine.py`), если модель распознана (Qwen2 + bitsandbytes NF4 + LoRA на q/v) и Soup
+обучает в fp16 на GPU класса T4. Тренер HF,
 оптимизатор, GradScaler, расписание lr, логирование и выходы Soup остаются своими.
 
 Один шаг обучения:
@@ -269,7 +270,8 @@ nvidia-smi базы на T4 - 14 345 MiB, из них 13 373 MiB - тензор�
 
 - `SFTTrainerWrapper.setup` - запуск фоновой компиляции, если она ещё не идёт;
 - `peft.prepare_model_for_kbit_training` - эмбеддинг Qwen2 остаётся в fp16;
-- `SFTTrainerWrapper.train` - если модель распознана, подменяет `compute_loss` тренера. Новый
+- `SFTTrainerWrapper.train` - если модель распознана и это fp16-путь Soup на GPU sm_70+ (класс
+  T4; условие ниже), подменяет `compute_loss` тренера. Новый
   `compute_loss` делает ту же бухгалтерию, что HF `Trainer` + TRL `SFTTrainer` + rewind-рекордер
   Soup: нормировка loss по `num_items_in_batch`, `entropy` по всем реальным токенам, `num_tokens`,
   `mean_token_accuracy` по токенам ответа, строки `rewind.jsonl` с loss каждой строки;
@@ -284,6 +286,13 @@ nvidia-smi базы на T4 - 14 345 MiB, из них 13 373 MiB - тензор�
 Это покрыто тестами `solution/test_fallback.py`. В фиксированном конфиге кейса эти ветки не
 срабатывают, но организаторы просят откат для неподдерживаемых входов
 ([t.me/souptasterschat/576](https://t.me/souptasterschat/576)).
+
+**Только fp16-путь на GPU класса T4** (`20206f1`). Слитый шаг и фоновая компиляция включаются,
+только если Soup обучает в fp16 (`fp16=True`, `bf16=False`) на GPU sm_70 или новее без bf16 - как
+на T4. На GPU с bf16 (A100, L4, H100) Soup обучает в bf16, а наш шаг считает в fp16 и поменял бы
+dtype вычислений, что запрещено ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)). На
+картах старше sm_70 (например, P100) Triton не работает. В обоих случаях идёт исходный код Soup, а
+наши кернелы даже не компилируются.
 
 Не меняются: модель, данные, батчи и их порядок, число шагов, LoRA (r, alpha, dropout 0,05,
 целевые модули), оптимизатор и расписание lr, настройки тренера, выходы Soup, аллокатор.
@@ -368,8 +377,8 @@ python harness/run_task.py --repeats 2
 python harness/check_rules.py
 ```
 
-На Ampere и новее Soup обучает в bf16 - это другой путь, наш шаг рассчитан на fp16-путь T4;
-тесты `solution/` проходят на любом CUDA GPU.
+Повторять замер нужно на T4: на Ampere и новее Soup обучает в bf16, и решение там намеренно
+не включается (обучение идёт исходным кодом Soup, см. "Как подключается").
 
 ### Регуляторы (`solution/patch.py`)
 
@@ -440,8 +449,11 @@ python harness/check_rules.py
 ## Ограничения и что не получилось
 
 - **Решение заточено под этот кейс:** Qwen2 (RoPE `default`, без sliding window), веса NF4 из
-  bitsandbytes, LoRA только на `q_proj`/`v_proj`, fp16-путь T4. Всё остальное идёт исходным кодом
-  Soup без ускорения - корректно, но медленно.
+  bitsandbytes, LoRA только на `q_proj`/`v_proj`, fp16-путь Soup на GPU sm_70+ без bf16 (T4).
+  Всё остальное идёт исходным кодом Soup без ускорения - корректно, но медленно. В том числе на
+  bf16-GPU (A100, L4, H100) решение не ускоряет ничего: Soup там обучает в bf16, а наш шаг
+  считает в fp16, и сменить dtype вычислений нельзя
+  ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)). bf16-вариант шага мы не делали.
 - **Скорость - наша слабая сторона.** GEMM cuBLAS занимают ~69% работы GPU в шаге и уже на потолке
   T4; свой GEMM на Triton для sm_75 без тензорных ядер не получился (см. эксперименты). Пересчёт
   слоя стоит до ~20% цикла, мы сознательно платим им за ~6x меньше памяти активаций.
