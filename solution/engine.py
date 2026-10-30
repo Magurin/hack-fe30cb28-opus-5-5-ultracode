@@ -944,6 +944,10 @@ class FusedQwen2:
         per_layer = n * 2 * I * 2
         return max(0, min(L, (cap - self._predicted_peak(n)) // per_layer))
 
+    def weights_on_host(self):
+        """Whether the loader already left the NF4 weights in host memory (solution/hostload)."""
+        return any(w.packed.device.type == "cpu" for spec in self.layers for w in spec.w.values())
+
     def offload_weights(self):
         """Keep the layers' NF4 weights in pinned host memory and stream them (WeightStream)."""
         if self.stream is None:

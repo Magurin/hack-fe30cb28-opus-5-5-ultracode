@@ -24,6 +24,8 @@ import torch
 
 _INSTALLED_ATTR = "_soup_kernels_engine"
 OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (engine.WeightStream)
+# put each NF4 layer weight in host memory right after the loader quantizes it (solution/hostload.py)
+HOST_NF4_AT_LOAD = True
 # Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
 # allocates, a long step makes the allocator's reservation grow (fragmentation) and CUDA modules
 # load during training; with 64 MiB a T4 run peaked 36 MiB above the load peak, with 112 MiB it
@@ -32,6 +34,10 @@ KEEP_MARGIN = 112 * 2**20
 # Memory the steps may use above the model-load peak to keep activations instead of recomputing
 # them (0: the run's peak stays the model load).
 EXTRA_MEMORY_MIB = 0
+# With the weights out of the GPU during the load (hostload, and the embedding in host memory),
+# the load no longer sets the run's peak; the steps do. If set, the memory (MiB, allocated) the
+# steps may reach while keeping activations, instead of the load peak minus KEEP_MARGIN.
+STEP_CAP_MIB = None
 
 
 def _restore_callback_base():
@@ -353,10 +359,20 @@ def install(trainer, seed=0):
     causal = model.get_base_model()
     fp16_embedding = _embedding_to_fp16(causal)
     engine = FusedQwen2(model, seed=seed)
+    if OFFLOAD_WEIGHTS and engine.weights_on_host():
+        # the loader left the NF4 weights in host memory (hostload): stream them from now on;
+        # peft created the LoRA weights next to them, they train on the GPU
+        engine.offload_weights()
+        for param in model.parameters():
+            if param.requires_grad and param.device != engine.device:
+                param.data = param.data.to(engine.device)
     # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
     # margin for allocator slack) to keep activations instead of recomputing them.
-    engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN
-                          + EXTRA_MEMORY_MIB * 2**20)
+    if STEP_CAP_MIB is not None:
+        engine.set_memory_cap(STEP_CAP_MIB * 2**20)
+    else:
+        engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN
+                              + EXTRA_MEMORY_MIB * 2**20)
     trainer._soup_original_compute_loss = trainer.compute_loss
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
@@ -409,6 +425,10 @@ def patch_soup():
 
     startup.import_without_wandb(sys.argv)  # imports trl, so after the snapshot above
     patch_prepare_kbit()
+    if HOST_NF4_AT_LOAD:
+        from . import hostload
+
+        hostload.patch_model_loading()
     from soup_cli.trainer import sft
 
     wrapper = sft.SFTTrainerWrapper
@@ -433,8 +453,8 @@ def patch_soup():
     @functools.wraps(original_train)
     def train(self, *args, **kwargs):
         trainer = getattr(self, "trainer", None)
+        installed = False
         if trainer is not None and isinstance(getattr(trainer, "model", None), torch.nn.Module):
-            installed = False
             try:
                 from . import warmup
 
@@ -449,6 +469,10 @@ def patch_soup():
                 _log(f"not installed ({exc.__class__.__name__}: {exc})")
             if not installed:
                 _restore_fp32_embeddings()
+        if not installed:
+            from . import hostload
+
+            hostload.restore(getattr(trainer, "model", None) or getattr(self, "model", None))
         return original_train(self, *args, **kwargs)
 
     train._soup_kernels_patched = True
