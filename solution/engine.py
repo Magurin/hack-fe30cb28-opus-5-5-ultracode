@@ -5,10 +5,11 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
 
 1. pad tokens are dropped: the rows of the batch are packed into one (N, H) sequence (N = real
    tokens), attention runs varlen over the packed rows, so no work and no memory goes to padding;
-2. every decoder layer is one autograd.Function (`_Layer`) that keeps for backward only what the
-   backward needs, in fp16 where the base also rounds to fp16: the fp32 residual, the attention
-   inputs/outputs and the fused [gate | up] GEMM output. NF4 weights are dequantized by our kernel
-   into one reusable buffer, once in forward and once in backward (as bitsandbytes does);
+2. every decoder layer is one autograd.Function (`_Layer`) that keeps only its input, the fp32
+   residual (6 KiB per token), and recomputes the rest of its forward in backward: about 6x less
+   activation memory than keeping the attention and MLP intermediates, for one extra pass of
+   the qkv, o and gate/up GEMMs. NF4 weights are dequantized by our kernel once in forward and
+   once in backward (as bitsandbytes does); the backward reuses them for the recomputation;
 3. the final norm, lm_head, cross-entropy and the metrics TRL / Soup log (entropy, token accuracy,
    per-row loss) are one chunked pass (`_Head`): logits exist for a chunk of rows at a time and the
    gradient w.r.t. the hidden state is formed in the same pass.
@@ -48,6 +49,7 @@ class NF4Weight:
     def __init__(self, param):
         qs = param.quant_state
         self.param = param
+        self.packed = param.data  # the device copy the kernel reads (see WeightStream)
         self.shape = tuple(int(s) for s in qs.shape)
         self.numel = self.shape[0] * self.shape[1]
         self.code = qs.code.float().contiguous()
@@ -67,9 +69,107 @@ class NF4Weight:
 
     def dequant_into(self, out):
         K.nf4_dequant_kernel[(_cdiv(self.numel, NF4_BLOCK),)](
-            self.param, self.absmax, self.code2, self.absmax2, self.offset, self.code, out,
+            self.packed, self.absmax, self.code2, self.absmax2, self.offset, self.code, out,
             self.numel, NESTED=self.nested, BS1=self.bs1, BS2=self.bs2, BLOCK=NF4_BLOCK)
         return out
+
+
+class WeightStream:
+    """The packed NF4 weights of every decoder layer live in pinned host memory during training;
+    a layer's bytes are copied into one of three device slots on a side stream, one layer ahead
+    of the compute (forward: i+1, backward: i-1). Slot i % 3 is only overwritten after the
+    compute stream has finished with the layer that held it before. 24 MiB per Qwen2.5-1.5B
+    layer, so 72 MiB on the GPU instead of ~650 MiB, for ~1.3 GB of PCIe traffic per step that
+    runs alongside the GEMMs."""
+
+    SLOTS = 3
+    NAMES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+    def __init__(self, specs, device):
+        self.specs, self.device = specs, device
+        self.layout = []  # per layer: (start, size, [[weight, packed off, n, absmax off, n]])
+        offset = 0
+        for spec in specs:
+            entries, start = [], offset
+            for name in self.NAMES:
+                w = spec.w[name]
+                pk = w.packed.reshape(-1).view(torch.uint8)
+                am = w.absmax.reshape(-1).view(torch.uint8)
+                entry = [w, offset, pk.numel(), 0, am.numel()]
+                offset = _align(offset + pk.numel())
+                entry[3] = offset
+                offset = _align(offset + am.numel())
+                entries.append(entry)
+            self.layout.append((start, offset - start, entries))
+        self.host = torch.empty((offset,), dtype=torch.uint8, pin_memory=True)
+        for _, _, entries in self.layout:
+            for w, po, pn, ao, an in entries:
+                self.host[po:po + pn].copy_(w.packed.reshape(-1).view(torch.uint8))
+                self.host[ao:ao + an].copy_(w.absmax.reshape(-1).view(torch.uint8))
+        torch.cuda.synchronize(device)
+        self.slot_bytes = max(size for _, size, _ in self.layout)
+        self.slots = [torch.empty((self.slot_bytes,), dtype=torch.uint8, device=device)
+                      for _ in range(self.SLOTS)]
+        self.slot_layer = [None] * self.SLOTS
+        self.copied = [torch.cuda.Event() for _ in range(self.SLOTS)]
+        self.released = [torch.cuda.Event() for _ in range(self.SLOTS)]
+        self.stream = torch.cuda.Stream(device)
+        # Free the device copies: meanwhile the bitsandbytes parameters point at the host bytes.
+        self.moved = []
+        for _, _, entries in self.layout:
+            for w, po, pn, ao, an in entries:
+                data, state = w.param.data, w.param.quant_state
+                self.moved.append(w)
+                w.param.data = self.host[po:po + pn].view(data.dtype).view(data.shape)
+                state.absmax = self.host[ao:ao + an].view(state.absmax.dtype).view(
+                    state.absmax.shape)
+                w.packed = w.absmax = None
+        torch.cuda.empty_cache()
+
+    def _load(self, i):
+        slot = i % self.SLOTS
+        if self.slot_layer[slot] == i:
+            return
+        start, size, _ = self.layout[i]
+        self.stream.wait_event(self.released[slot])
+        with torch.cuda.stream(self.stream):
+            self.slots[slot][:size].copy_(self.host[start:start + size], non_blocking=True)
+            self.copied[slot].record(self.stream)
+        self.slot_layer[slot] = i
+
+    def acquire(self, i, ahead):
+        """Make layer i's weights usable on the current stream; start fetching layer `ahead`."""
+        self._load(i)
+        slot = i % self.SLOTS
+        torch.cuda.current_stream(self.device).wait_event(self.copied[slot])
+        start, _, entries = self.layout[i]
+        buf = self.slots[slot]
+        for w, po, pn, ao, an in entries:
+            w.packed = buf[po - start:po - start + pn]
+            absmax = buf[ao - start:ao - start + an]
+            w.absmax = absmax if w.nested else absmax.view(torch.float32)
+        if 0 <= ahead < len(self.layout):
+            self._load(ahead)
+
+    def release(self, i):
+        self.released[i % self.SLOTS].record(torch.cuda.current_stream(self.device))
+
+    def restore(self):
+        """Put the weights back on the device (after training, for whatever Soup does next)."""
+        torch.cuda.synchronize(self.device)
+        for w in self.moved:
+            state = w.param.quant_state
+            w.param.data = w.param.data.to(self.device)
+            state.absmax = state.absmax.to(self.device)
+            w.packed = w.param.data
+            w.absmax = state.absmax if w.nested else state.absmax.float()
+        self.moved = []
+        self.slots = []
+        torch.cuda.synchronize(self.device)
+
+
+def _align(n, a=256):
+    return (n + a - 1) // a * a
 
 
 def dequant(weights, device):
@@ -106,6 +206,9 @@ class Packed:
         shifted = torch.full_like(labels, -100)
         shifted[:, :-1] = labels[:, 1:]
         self.targets = shifted.reshape(-1)[flat].contiguous()
+        supervised = self.targets >= 0
+        self.head_order = torch.argsort((~supervised).to(torch.int8), stable=True)
+        self.n_supervised = int(supervised.sum())
         cu = [0]
         for length in self.lengths:
             cu.append(cu[-1] + length)
@@ -172,8 +275,10 @@ def _expand_kv(x, group):
 # One decoder layer
 # ---------------------------------------------------------------------------------------------
 class LayerSpec:
-    def __init__(self, layer, config, lora_names):
+    def __init__(self, layer, config, lora_names, index):
         attn, mlp = layer.self_attn, layer.mlp
+        self.index = index
+        self.stream = None  # a WeightStream, once training starts
         self.H = config.hidden_size
         self.D = getattr(config, "head_dim", None) or self.H // config.num_attention_heads
         self.HQ = config.num_attention_heads
@@ -291,128 +396,149 @@ def _glu_bwd(dm, gu, I):
         K.glu_bwd_kernel[(n, _cdiv(I, GLU_BLOCK))](dm, gu, I, BLOCK=GLU_BLOCK)
 
 
-def _ce(logits, targets, tok_loss, entropy, correct):
+def _ce(logits, targets, tok_loss, entropy, correct, zero_unsupervised=True):
     rows, V = logits.shape
     if rows:
         K.lm_head_ce_kernel[(rows,)](logits, targets, tok_loss, entropy, correct, V,
-                                     BLOCK=CE_BLOCK, num_warps=8)
+                                     int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
+
+
+def _layer_forward(spec, h, packed, lora16, seeds, keep):
+    """One decoder layer forward. With keep=True also returns what the backward reads."""
+    n, H = h.shape
+    D, HQ, HKV = spec.D, spec.HQ, spec.HKV
+    group = HQ // HKV
+    dev = h.device
+    aq_w, bq_w, av_w, bv_w = lora16
+    lora_scale = _lora_scale(spec)
+    saved = {}
+
+    # input RMSNorm (+ the dropout'ed copies the LoRA A matrices read)
+    _, a, aq, av, rstd1 = _rms_fwd(spec, h, spec.ln1, packed, seeds=seeds,
+                                   drop_q=aq_w is not None, drop_v=av_w is not None)
+
+    # q, k, v in one GEMM; LoRA as two thin GEMMs per target
+    w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+    qkv = torch.addmm(spec.bias_qkv, a, w.t())
+    del a
+    if keep:
+        saved["w_qkv"] = w
+    del w
+    xq = xv = lq = lv = None
+    if aq_w is not None:
+        xq = aq @ aq_w.t()
+        lq = xq @ bq_w.t()
+    if av_w is not None:
+        xv = av @ av_w.t()
+        lv = xv @ bv_w.t()
+    q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
+    del qkv, lq, lv
+    k_e, v_e = _expand_kv(k, group), _expand_kv(v, group)
+    out, lse, aseed, aoffset = _attn_fwd(q, k_e, v_e, packed, spec.scale)
+
+    w = dequant([spec.w["o_proj"]], dev)
+    o = out.reshape(n, HQ * D) @ w.t()
+    if keep:
+        saved["w_o"] = w
+    del w
+    h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
+    del o
+    w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
+    gu = b @ w.t()
+    del b
+    if keep:
+        saved.update(w_gu=w, rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e,
+                     out=out, lse=lse, aseed=aseed, aoffset=aoffset, h2=h2, rstd2=rstd2, gu=gu)
+        return None, saved
+    del w, aq, av, q, k, v, k_e, v_e, out, lse
+    m = _glu_fwd(gu, spec.I)
+    del gu
+    w = dequant([spec.w["down_proj"]], dev)
+    d = m @ w.t()
+    del w, m
+    return torch.add(h2, d), None
 
 
 class _Layer(torch.autograd.Function):
+    """One decoder layer. Only its input (the fp32 residual) is kept for backward; the backward
+    runs the forward again up to the MLP input, with the same dropout seeds, and then goes back
+    through it. The LoRA weights are inputs, so autograd hands their gradients to the optimizer."""
+
     @staticmethod
     def forward(ctx, h, spec, packed, aq_w, bq_w, ak_w, bk_w, av_w, bv_w):
-        n, H = h.shape
-        D, HQ, HKV = spec.D, spec.HQ, spec.HKV
-        group = HQ // HKV
-        dev = h.device
-        has = {"q": aq_w is not None, "k": ak_w is not None, "v": av_w is not None}
-        seeds = (packed.seed() if has["q"] else 0, packed.seed() if has["v"] else 0)
-        lora_scale = _lora_scale(spec)
-
-        # input RMSNorm (+ the dropout'ed copies the LoRA A matrices read)
-        _, a, aq, av, rstd1 = _rms_fwd(spec, h, spec.ln1, packed, seeds=seeds,
-                                       drop_q=has["q"], drop_v=has["v"])
-        if has["k"]:
+        if ak_w is not None:
             raise NotImplementedError("LoRA on k_proj")
-
-        # q, k, v in one GEMM; LoRA as two thin GEMMs per target
-        w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
-        qkv = torch.addmm(spec.bias_qkv, a, w.t())
-        del w
-        xq = xv = lq = lv = None
-        if has["q"]:
-            xq = aq @ aq_w.to(torch.float16).t()
-            lq = xq @ bq_w.to(torch.float16).t()
-        if has["v"]:
-            xv = av @ av_w.to(torch.float16).t()
-            lv = xv @ bv_w.to(torch.float16).t()
-        del aq, av
-        q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
-        del qkv, lq, lv
-
-        out, lse, aseed, aoffset = _attn_fwd(q, _expand_kv(k, group), _expand_kv(v, group),
-                                             packed, spec.scale)
-        w = dequant([spec.w["o_proj"]], dev)
-        o = out.reshape(n, HQ * D) @ w.t()
-        del w
-
-        h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
-        del o
-        w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
-        gu = b @ w.t()
-        del w, b
-        m = _glu_fwd(gu, spec.I)
-        w = dequant([spec.w["down_proj"]], dev)
-        d = m @ w.t()
-        del w, m
-        h3 = torch.add(h2, d)
-
-        ctx.save_for_backward(h, rstd1, h2, rstd2, q, k, v, out, lse, aseed, aoffset, gu,
-                              xq, xv, aq_w, bq_w, av_w, bv_w)
-        ctx.spec, ctx.packed, ctx.seeds, ctx.has, ctx.lora_scale = spec, packed, seeds, has, \
-            lora_scale
+        seeds = (packed.seed() if aq_w is not None else 0,
+                 packed.seed() if av_w is not None else 0)
+        lora16 = tuple(None if t is None else t.to(torch.float16)
+                       for t in (aq_w, bq_w, av_w, bv_w))
+        if spec.stream is not None:
+            spec.stream.acquire(spec.index, spec.index + 1)
+        h3, _ = _layer_forward(spec, h, packed, lora16, seeds, keep=False)
+        if spec.stream is not None:
+            spec.stream.release(spec.index)
+        ctx.save_for_backward(h, aq_w, bq_w, av_w, bv_w)
+        ctx.spec, ctx.packed, ctx.seeds = spec, packed, seeds
         return h3
 
     @staticmethod
     def backward(ctx, dh3):
-        (h, rstd1, h2, rstd2, q, k, v, out, lse, aseed, aoffset, gu, xq, xv,
-         aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
-        spec, packed, seeds, has, s = ctx.spec, ctx.packed, ctx.seeds, ctx.has, ctx.lora_scale
+        h, aq_w, bq_w, av_w, bv_w = ctx.saved_tensors
+        spec, packed, seeds = ctx.spec, ctx.packed, ctx.seeds
+        s = _lora_scale(spec)
         n, H = h.shape
         D, HQ, HKV = spec.D, spec.HQ, spec.HKV
-        group = HQ // HKV
+        C = (HQ + 2 * HKV) * D
         dev = h.device
         dh3 = dh3.contiguous()
+        lora16 = tuple(None if t is None else t.to(torch.float16)
+                       for t in (aq_w, bq_w, av_w, bv_w))
+        if spec.stream is not None:
+            spec.stream.acquire(spec.index, spec.index - 1)
+        with torch.no_grad():
+            _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True)
 
         # MLP
         w = dequant([spec.w["down_proj"]], dev)
         dm = dh3.to(torch.float16) @ w
         del w
+        gu = f.pop("gu")
         _glu_bwd(dm, gu, spec.I)
         del dm
-        w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
-        db = gu @ w
-        del w, gu
-        dh2 = _rms_bwd(spec, db, h2, rstd2, spec.ln2, packed, dres=dh3)
-        del db
+        db = gu @ f.pop("w_gu")
+        del gu
+        dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
+        del db, dh3
 
         # attention
-        w = dequant([spec.w["o_proj"]], dev)
-        dout = (dh2.to(torch.float16) @ w).view(n, HQ, D)
-        del w
-        dq, dk, dv = _attn_bwd(dout, q, _expand_kv(k, group), _expand_kv(v, group), out, lse,
-                               aseed, aoffset, packed, spec.scale)
+        dout = (dh2.to(torch.float16) @ f.pop("w_o")).view(n, HQ, D)
+        dq, dk, dv = _attn_bwd(dout, f.pop("q"), f.pop("k_e"), f.pop("v_e"), f.pop("out"),
+                               f.pop("lse"), f.pop("aseed"), f.pop("aoffset"), packed, spec.scale)
         del dout
-        C = (HQ + 2 * HKV) * D
         dqkv = _rope_bwd(spec, dq, dk, dv, packed)
         del dq, dk, dv
-        w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
-        da = dqkv @ w
-        del w
+        da = dqkv @ f.pop("w_qkv")
 
         # LoRA: dB = s g^T x, dx = s g B, dA = dx^T drop(a), d drop(a) = dx A
         grads = {"q": (None, None, None), "v": (None, None, None)}
-        if has["q"] or has["v"]:
-            _, _, aq, av, _ = _rms_fwd(spec, h, spec.ln1, packed, write_y=False, seeds=seeds,
-                                       drop_q=has["q"], drop_v=has["v"])
-            for short, x_lo, a_w, b_w, a_in, cols in (
-                    ("q", xq, aq_w, bq_w, aq, slice(0, HQ * D)),
-                    ("v", xv, av_w, bv_w, av, slice((HQ + HKV) * D, C))):
-                if not has[short]:
-                    continue
-                g = dqkv[:, cols]
-                b16 = b_w.to(torch.float16)
-                db_w = (g.t() @ x_lo).float() * s
-                dx_lo = (g @ b16) * s
-                da_w = (dx_lo.t() @ a_in).float()
-                t = dx_lo @ a_w.to(torch.float16)
-                grads[short] = (da_w, db_w, t)
-            del aq, av
+        for short, a_w, b_w, cols in (("q", lora16[0], lora16[1], slice(0, HQ * D)),
+                                      ("v", lora16[2], lora16[3], slice((HQ + HKV) * D, C))):
+            if a_w is None:
+                continue
+            x_lo, a_in = f.pop("x" + short), f.pop("a" + short)
+            g = dqkv[:, cols]
+            db_w = (g.t() @ x_lo).float() * s
+            dx_lo = (g @ b_w) * s
+            da_w = (dx_lo.t() @ a_in).float()
+            grads[short] = (da_w, db_w, dx_lo @ a_w)
+            del x_lo, a_in
         del dqkv
+        if spec.stream is not None:
+            spec.stream.release(spec.index)
         dh = None
         if ctx.needs_input_grad[0]:
-            dh = _rms_bwd(spec, da, h, rstd1, spec.ln1, packed, dres=dh2, tq=grads["q"][2],
-                          tv=grads["v"][2], seeds=seeds)
+            dh = _rms_bwd(spec, da, h, f["rstd1"], spec.ln1, packed, dres=dh2,
+                          tq=grads["q"][2], tv=grads["v"][2], seeds=seeds)
         return (dh, None, None, grads["q"][0], grads["q"][1], None, None, grads["v"][0],
                 grads["v"][1])
 
@@ -425,15 +551,23 @@ class HeadStats:
 
 
 class _Head(torch.autograd.Function):
+    """Final RMSNorm + lm_head + cross-entropy + the logged metrics, in chunks of rows. The rows
+    are taken supervised-first: every row needs its logits (entropy and accuracy are logged over
+    all of them), but only rows with a target have a gradient, so chunks of prompt rows skip the
+    backward GEMM through the 151,936 x 1536 lm_head weight."""
+
     @staticmethod
     def forward(ctx, h, norm_w, eps, lm_w, packed, denom, stats):
         n, H = h.shape
-        V = lm_w.shape[0]
         dev = h.device
         spec = HeadStats()
         spec.eps = eps
-        _, hn, _, _, rstd = _rms_fwd(spec, h, norm_w, packed)
-        dh = torch.empty_like(h)
+        order = packed.head_order
+        n_sup = packed.n_supervised
+        hp = h.index_select(0, order)
+        targets = packed.targets.index_select(0, order)
+        _, hn, _, _, rstd = _rms_fwd(spec, hp, norm_w, packed)
+        dhp = torch.empty_like(hp)
         tok_loss = torch.empty((n,), device=dev, dtype=torch.float32)
         entropy = torch.empty((n,), device=dev, dtype=torch.float32)
         correct = torch.empty((n,), device=dev, dtype=torch.int32)
@@ -441,14 +575,23 @@ class _Head(torch.autograd.Function):
         for c0 in range(0, n, HEAD_CHUNK):
             c1 = min(n, c0 + HEAD_CHUNK)
             logits = hn[c0:c1] @ lm_w.t()
-            _ce(logits, packed.targets[c0:c1], tok_loss[c0:c1], entropy[c0:c1], correct[c0:c1])
-            dhn = logits @ lm_w
-            del logits
-            _rms_bwd(spec, dhn, h[c0:c1], rstd[c0:c1], norm_w, packed, grad_scale=inv,
-                     out=dh[c0:c1])
-            del dhn
+            needs_grad = c0 < n_sup
+            _ce(logits, targets[c0:c1], tok_loss[c0:c1], entropy[c0:c1], correct[c0:c1],
+                zero_unsupervised=needs_grad)
+            if needs_grad:
+                dhn = logits @ lm_w
+                del logits
+                _rms_bwd(spec, dhn, hp[c0:c1], rstd[c0:c1], norm_w, packed, grad_scale=inv,
+                         out=dhp[c0:c1])
+                del dhn
+            else:
+                del logits
+                dhp[c0:c1].zero_()
+        dh = torch.empty_like(h)
+        dh.index_copy_(0, order, dhp)
+        del dhp, hp
         ctx.save_for_backward(dh)
-        stats.tok_loss, stats.entropy, stats.correct = tok_loss, entropy, correct
+        stats.order, stats.tok_loss, stats.entropy, stats.correct = order, tok_loss, entropy,             correct
         return tok_loss.sum() * inv
 
     @staticmethod
@@ -471,7 +614,9 @@ class FusedQwen2:
         self.config = config
         self.device = inner.embed_tokens.weight.device
         lora_names = _lora_targets(inner.layers[0])
-        self.layers = [LayerSpec(layer, config, lora_names) for layer in inner.layers]
+        self.layers = [LayerSpec(layer, config, lora_names, i)
+                       for i, layer in enumerate(inner.layers)]
+        self.stream = None
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
         self.norm_w = inner.norm.weight
         self.eps = float(inner.norm.variance_epsilon)
@@ -479,6 +624,20 @@ class FusedQwen2:
         self.lm_w = causal.lm_head.weight
         self.rope = RopeTable(inner.rotary_emb, self.layers[0].D, self.device)
         self.rng = random.Random(seed)
+
+    def offload_weights(self):
+        """Keep the layers' NF4 weights in pinned host memory and stream them (WeightStream)."""
+        if self.stream is None:
+            self.stream = WeightStream(self.layers, self.device)
+            for spec in self.layers:
+                spec.stream = self.stream
+
+    def restore_weights(self):
+        if self.stream is not None:
+            for spec in self.layers:
+                spec.stream = None
+            self.stream.restore()
+            self.stream = None
 
     def step(self, input_ids, attention_mask, labels, denom, training=True):
         p = self.dropout_p if training else 0.0

@@ -11,7 +11,8 @@ the matrix multiplies stay in cuBLAS, the kernels below do everything around the
   glu_fwd_kernel       silu(g) * u over the fused [g|u] GEMM output
   glu_bwd_kernel       its backward, written in place as fused [dg|du] for one GEMM
   lm_head_ce_kernel    cross-entropy, entropy, argmax and dlogits over a 151,936-word vocabulary,
-                       for a chunk of rows, without materializing anything but the fp16 logits
+                       for a chunk of rows, without materializing anything but the fp16 logits;
+                       rows without a target (the prompt) get entropy and argmax only
 
 Ideas (no code taken): fused RMSNorm and chunked "fused linear cross-entropy" as in Liger-Kernel
 (https://github.com/linkedin/Liger-Kernel) and Unsloth (https://github.com/unslothai/unsloth);
@@ -243,11 +244,11 @@ def glu_bwd_kernel(dm_ptr, gu_ptr, I, BLOCK: tl.constexpr):
 # --------------------------------------------------------------------------------------------
 # One row of fp16 logits per program: logsumexp, entropy and argmax in one online pass, then
 # the gradient softmax - onehot (unscaled) written over the logits in a second pass. Rows with
-# target < 0 get entropy and argmax only, and a zero gradient.
+# target < 0 get entropy and argmax only (and zeros, if the chunk's gradient GEMM will read them).
 # --------------------------------------------------------------------------------------------
-@triton.jit
+@triton.jit(do_not_specialize=["zero_unsupervised"])
 def lm_head_ce_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, correct_ptr, V,
-                      BLOCK: tl.constexpr):
+                      zero_unsupervised, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     src = logits_ptr + row * V
     cols = tl.arange(0, BLOCK)
@@ -276,9 +277,13 @@ def lm_head_ce_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, correct_ptr
     x_t = tl.load(src + tl.maximum(target, 0)).to(tl.float32)
     tl.store(loss_ptr + row, tl.where(valid, lse - x_t, 0.0))
     tl.store(correct_ptr + row, (valid & (best_idx == target)).to(tl.int32))
-    for start in range(0, V, BLOCK):
-        inside = start + cols < V
-        x = tl.load(src + start + cols, mask=inside, other=0.0).to(tl.float32)
-        grad = tl.exp(x - lse) - tl.where(start + cols == target, 1.0, 0.0)
-        grad = tl.where(valid, grad, 0.0)
-        tl.store(src + start + cols, grad.to(tl.float16), mask=inside)
+    if valid:
+        for start in range(0, V, BLOCK):
+            inside = start + cols < V
+            x = tl.load(src + start + cols, mask=inside, other=0.0).to(tl.float32)
+            grad = tl.exp(x - lse) - tl.where(start + cols == target, 1.0, 0.0)
+            tl.store(src + start + cols, grad.to(tl.float16), mask=inside)
+    elif zero_unsupervised != 0:
+        for start in range(0, V, BLOCK):
+            inside = start + cols < V
+            tl.store(src + start + cols, tl.zeros((BLOCK,), tl.float16), mask=inside)

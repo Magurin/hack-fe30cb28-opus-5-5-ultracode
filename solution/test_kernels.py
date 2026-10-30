@@ -33,9 +33,8 @@ def test_nf4_dequant_matches_bitsandbytes(nested, shape):
         pass
 
     p = P()
-    p.quant_state = state
+    p.quant_state, p.data = state, packed
     weight = NF4Weight(p)
-    weight.param = packed
     out = torch.empty(shape, device=DEV, dtype=torch.float16)
     weight.dequant_into(out)
     assert torch.equal(out, ref)
@@ -178,7 +177,7 @@ def test_lm_head_ce(V):
     loss = torch.empty(n, device=DEV)
     ent = torch.empty(n, device=DEV)
     correct = torch.empty(n, device=DEV, dtype=torch.int32)
-    K.lm_head_ce_kernel[(n,)](work, target, loss, ent, correct, V, BLOCK=4096, num_warps=8)
+    K.lm_head_ce_kernel[(n,)](work, target, loss, ent, correct, V, 1, BLOCK=4096, num_warps=8)
     close(loss, ce, 1e-4)
     close(ent, entropy, 1e-3)
     valid = target >= 0
@@ -291,3 +290,37 @@ def test_fused_step_matches_hf(tmp_path):
     for g, r in zip(grads, ref_grads):
         rel = (g.float() - r.float()).norm() / r.float().norm().clamp(min=1e-12)
         assert rel < 2e-2, rel.item()
+
+
+def test_weight_streaming_is_exact(tmp_path):
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    torch.manual_seed(2)
+    B, T = 3, 40
+    ids = torch.randint(0, 3000, (B, T), device=DEV)
+    mask = torch.ones(B, T, device=DEV, dtype=torch.long)
+    mask[1, 25:] = 0
+    labels = torch.where(mask.bool(), ids, -100)
+    params = [p for p in model.parameters() if p.requires_grad]
+    before = {n: p.detach().clone() for n, p in model.named_parameters() if p.is_cuda}
+
+    def run(offload):
+        engine = FusedQwen2(model, seed=7)
+        if offload:
+            engine.offload_weights()
+        loss, _, _ = engine.step(ids, mask, labels, 50.0)
+        grads = torch.autograd.grad(loss, params)
+        if offload:
+            engine.restore_weights()
+        return loss, grads
+
+    loss_a, grads_a = run(False)
+    loss_b, grads_b = run(True)
+    assert torch.equal(loss_a, loss_b)
+    for a, b in zip(grads_a, grads_b):
+        assert torch.equal(a, b)
+    for n, p in model.named_parameters():
+        if n in before:
+            assert p.is_cuda and torch.equal(p.detach(), before[n]), n

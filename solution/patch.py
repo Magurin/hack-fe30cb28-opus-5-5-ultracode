@@ -1,10 +1,15 @@
-"""How the fused step plugs into Soup: one patch of `SFTTrainerWrapper.train`.
+"""How the fused step plugs into Soup: patches of `SFTTrainerWrapper.setup` / `.train` and of
+peft's `prepare_model_for_kbit_training`.
 
-When Soup is about to train, the trainer and the 4-bit PEFT model exist. If the model is the
-one we know (Qwen2 + bitsandbytes NF4 + LoRA on q/k/v projections), we
-- store the frozen tied embedding / lm_head in fp16 instead of fp32 (lossless: the fp32 values
-  were upcast from the fp16 checkpoint load, and the base casts the lm_head to fp16 anyway);
-- replace the trainer's `compute_loss` with `fused_compute_loss`, which runs `FusedQwen2.step`
+- `setup`: starts compiling our kernels in the background (solution/warmup.py) while Soup
+  loads the model;
+- `prepare_model_for_kbit_training`: leaves the frozen, tied embedding / lm_head of a Qwen2 in
+  its fp16 load dtype instead of upcasting it to fp32 (933 MiB instead of 467, and a 1.4 GiB
+  transient during the cast). Our step reads it in fp16 exactly as the base does: the base's
+  fp32 embedding rows are exact copies of fp16 values, and its lm_head runs in fp16 under
+  autocast. If the fused step is not installed after all, the fp32 copy is restored;
+- `train`: when the trainer and the 4-bit PEFT model exist and are the ones we know (Qwen2 +
+  bitsandbytes NF4 + LoRA on q/v projections), we replace the trainer's `compute_loss` with `fused_compute_loss`, which runs `FusedQwen2.step`
   and then does exactly the bookkeeping HF Trainer, TRL's SFTTrainer and Soup's rewind recorder
   do in theirs (same loss normalization, same logged metrics, same rewind rows).
 Anything we do not recognize falls through to the original code untouched.
@@ -17,6 +22,24 @@ import types
 import torch
 
 _INSTALLED_ATTR = "_soup_kernels_engine"
+OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (engine.WeightStream)
+
+
+def _restore_callback_base():
+    import transformers
+
+    return transformers.TrainerCallback
+
+
+class _RestoreWeights(_restore_callback_base()):
+    """Puts the streamed weights back on the GPU when training ends, so saving the adapter and
+    anything Soup does afterwards sees an ordinary model."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.engine.restore_weights()
 
 
 def _log(message):
@@ -72,19 +95,63 @@ def _is_supported(model):
     return True
 
 
+_KEPT_FP16 = []  # embedding weights prepare_model_for_kbit_training left in fp16
+
+
 def _embedding_to_fp16(causal):
-    """The tied embedding / lm_head weight is frozen and fp32 only because peft upcast every
-    non-quantized parameter; if every value is exactly representable in fp16, keep it in fp16."""
+    """The tied embedding / lm_head weight is frozen; if it is fp32 (peft upcast it) and every
+    value is exactly representable in fp16, keep it in fp16. Checked in slices so no second
+    full-size copy is ever alive."""
     weight = causal.model.embed_tokens.weight
+    if weight.dtype == torch.float16:
+        return True
     if weight.dtype != torch.float32:
         return False
-    half = weight.data.to(torch.float16)
-    if not torch.equal(half.float(), weight.data):
-        del half
-        return False
-    weight.data = half
+    for rows in weight.data.split(8192):
+        if not torch.equal(rows.to(torch.float16).float(), rows):
+            return False
+    weight.data = weight.data.to(torch.float16)
     torch.cuda.empty_cache()
     return True
+
+
+def _restore_fp32_embeddings():
+    while _KEPT_FP16:
+        weight = _KEPT_FP16.pop()
+        if weight.dtype != torch.float32:
+            weight.data = weight.data.to(torch.float32)
+
+
+def patch_prepare_kbit():
+    import peft
+
+    original = peft.prepare_model_for_kbit_training
+    if getattr(original, "_soup_kernels_patched", False):
+        return
+
+    @functools.wraps(original)
+    def prepare(model, *args, **kwargs):
+        weight = None
+        try:
+            config = getattr(model, "config", None)
+            embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings")                 else None
+            if getattr(config, "model_type", None) == "qwen2" and embed is not None                     and getattr(model, "is_loaded_in_4bit", False)                     and embed.weight.dtype == torch.float16 and embed.weight.is_cuda:
+                weight = embed.weight
+        except Exception:  # noqa: BLE001
+            weight = None
+        if weight is None:
+            return original(model, *args, **kwargs)
+        data = weight.data
+        weight.data = torch.empty(0, device=data.device, dtype=data.dtype)
+        try:
+            result = original(model, *args, **kwargs)
+        finally:
+            weight.data = data
+        _KEPT_FP16.append(weight)
+        return result
+
+    prepare._soup_kernels_patched = True
+    peft.prepare_model_for_kbit_training = prepare
 
 
 def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -113,6 +180,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
     else:
         denom = (labels[:, 1:] != -100).sum()
     denom = float(denom.item() if torch.is_tensor(denom) else denom)
+    if OFFLOAD_WEIGHTS:
+        engine.offload_weights()  # first step: move the NF4 layer weights to pinned host memory
     loss, packed, stats = engine.step(input_ids, attention_mask, labels, denom)
     if self.args.average_tokens_across_devices and self.model_accepts_loss_kwargs \
             and num_items_in_batch is not None:
@@ -144,7 +213,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
             with torch.no_grad():
                 rows = packed.rows
                 totals = torch.zeros(rows, device=labels.device, dtype=torch.float32)
-                totals.index_add_(0, packed.row_of_token, stats.tok_loss)
+                totals.index_add_(0, packed.row_of_token.index_select(0, stats.order),
+                                  stats.tok_loss)
                 counts = (labels[:, 1:] != -100).sum(dim=1)
                 means = totals / counts.clamp(min=1).to(totals.dtype)
             state.on_micro_batch(step=int(self.state.global_step) + 1,
@@ -175,6 +245,7 @@ def install(trainer, seed=0):
     trainer._soup_original_compute_loss = trainer.compute_loss
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
+    trainer.add_callback(_RestoreWeights(engine))
     mib = 2**20
     _log(f"fused Qwen2 step installed ({len(engine.layers)} layers, LoRA dropout "
          f"{engine.dropout_p}, embedding in fp16: {fp16_embedding}); CUDA memory before "
@@ -185,6 +256,7 @@ def install(trainer, seed=0):
 
 
 def patch_soup():
+    patch_prepare_kbit()
     from soup_cli.trainer import sft
 
     wrapper = sft.SFTTrainerWrapper
@@ -210,14 +282,17 @@ def patch_soup():
     def train(self, *args, **kwargs):
         trainer = getattr(self, "trainer", None)
         if trainer is not None and isinstance(getattr(trainer, "model", None), torch.nn.Module):
+            installed = False
             try:
                 from . import warmup
 
                 warmup.wait()
                 seed = int(getattr(getattr(trainer, "args", None), "seed", 0) or 0)
-                install(trainer, seed=seed)
+                installed = install(trainer, seed=seed)
             except Exception as exc:  # noqa: BLE001 - never break Soup
                 _log(f"not installed ({exc.__class__.__name__}: {exc})")
+            if not installed:
+                _restore_fp32_embeddings()
         return original_train(self, *args, **kwargs)
 
     train._soup_kernels_patched = True

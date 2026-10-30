@@ -42,12 +42,10 @@ def _run(dims, dropout_p):
     w = torch.ones((H,), device=dev)
     h16 = torch.randn((1, H), **f16)
     seeds = (3, 5)
-    # input norm with both LoRA dropouts, post-attention norm with residual, final norm,
-    # dropout regeneration in backward
+    # input norm with both LoRA dropouts, post-attention norm with residual, final norm
     E._rms_fwd(spec, x, w, packed, seeds=seeds, drop_q=True, drop_v=True)
     E._rms_fwd(spec, x, w, packed, delta=h16)
     _, _, _, _, rstd = E._rms_fwd(spec, x, w, packed)
-    E._rms_fwd(spec, x, w, packed, write_y=False, seeds=seeds, drop_q=True, drop_v=True)
     E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x)
     E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x, tq=h16, tv=h16, seeds=seeds)
     E._rms_bwd(spec, h16, x, rstd, w, packed, grad_scale=0.5, out=torch.empty_like(x))
@@ -72,9 +70,8 @@ def _run(dims, dropout_p):
     packed_w, state = F.quantize_4bit(torch.randn((64, 256), **f16), blocksize=64,
                                       quant_type="nf4", compress_statistics=True)
     holder = _Dims()
-    holder.quant_state = state
+    holder.quant_state, holder.data = state, packed_w
     weight = E.NF4Weight(holder)
-    weight.param = packed_w
     weight.dequant_into(torch.empty((64, 256), **f16))
 
     # cuBLAS fp16 GEMMs and the varlen attention kernels, forward and backward
