@@ -377,9 +377,33 @@ python harness/run_task.py --repeats 2
 python harness/check_rules.py
 ```
 
-Повторять замер нужно на T4: на Ampere и новее Soup обучает в bf16, и решение там намеренно
-не включается (обучение идёт исходным кодом Soup, см. "Как подключается"). Тесты `solution/`
-(24, включая откат) и 79 тестов Soup проходят и на bf16-GPU: проверено на RTX 4060 после `20206f1`.
+Повторять замер нужно на T4. **На Ampere и новее (RTX 30xx/40xx, A100, L4, H100) слитый шаг
+сам не включается, так и задумано** (`20206f1`): Soup там обучает в bf16, и в логе решения будет
+`[solution] not the fp16 training path of a T4-class GPU ...: training with the original code path`.
+Это не поломка - обучение идёт исходным кодом Soup, со временем и памятью базы. Тесты `solution/`
+(24, включая откат) и 79 тестов Soup на таких GPU проходят: они не зависят от пути обучения
+(проверено на RTX 4060 после `20206f1`).
+
+Чтобы посмотреть сам слитый шаг на bf16-GPU, Soup нужно принудительно перевести на его fp16-путь,
+как на T4. Мы делали это обёрткой только для локальной отладки (в решение она не входит):
+
+```python
+# fp16_path.py: запуск harness/_train.py так, будто GPU не поддерживает bf16
+import runpy, sys
+import soup_cli.utils.gpu as gpu
+
+gpu.cuda_supports_bf16 = lambda: False  # Soup выбирает fp16, наше решение видит fp16-путь T4
+sys.path.insert(0, "harness")
+sys.argv = ["harness/_train.py"] + sys.argv[1:]
+runpy.run_path("harness/_train.py", run_name="__main__")
+```
+
+```bash
+python harness/run_task.py --repeats 1      # один раз: создаёт runs/<прогон>/task.yaml
+python fp16_path.py --config runs/solution_1/task.yaml --metrics m.json --solution
+```
+
+Так мы получали локальные цифры на RTX 4060; засчитываемые замеры - только T4.
 
 ### Регуляторы (`solution/patch.py`)
 
