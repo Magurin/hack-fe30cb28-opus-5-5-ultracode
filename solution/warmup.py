@@ -18,6 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+# One compile thread: on Kaggle's 2 cores x 2 threads, every further one slows Soup's model load
+# more than it shortens the compilation (3 threads: 0.8-1.3 s more outside the training loop).
+COMPILE_THREADS = 1
 _thread = None
 _timing = {}
 
@@ -99,14 +102,13 @@ def _run(dims, dropout_p):
         finally:
             E._COMPILE_ONLY.kernels = None
 
-    # One task per @triton.jit function (its variants one after the other), so no two threads
-    # compile into the same kernel's cache; code generation, LLVM and ptxas of different kernels
-    # then overlap.
+    # One task per @triton.jit function (its variants one after the other), so with several
+    # threads no two compile into the same kernel's cache.
     jobs = [rms_forward, rms_backward, glu, ce, nf4,
             lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
                                 empty(1, HKV * D, dtype=f16), packed, 2.0),
             lambda: E._rope_bwd(spec, grads, grads, grads, packed)]
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="solution-compile",
+    with ThreadPoolExecutor(max_workers=COMPILE_THREADS, thread_name_prefix="solution-compile",
                             initializer=_lower_priority) as pool:
         for future in [pool.submit(compile_only, job) for job in jobs]:
             future.result()

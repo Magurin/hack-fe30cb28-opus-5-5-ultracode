@@ -13,12 +13,12 @@ def apply():
 
     startup.import_bitsandbytes()  # before peft imports it, see solution/startup.py
     startup.import_without_sklearn()
-    from .patch import patch_soup
-
-    try:  # compile our kernels in the background from now on, while Soup sets up
+    try:  # compile our kernels in the background from now on, while Soup imports and sets up
         from . import warmup
 
         warmup.start_from_command_line(sys.argv)
     except Exception as exc:  # noqa: BLE001 - a missed warm-up only costs time
         print(f"[solution] early kernel warm-up not started ({exc})", file=sys.stderr)
+    from .patch import patch_soup
+
     patch_soup()
