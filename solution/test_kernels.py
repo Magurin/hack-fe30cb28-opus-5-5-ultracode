@@ -107,11 +107,12 @@ def test_qkv_rope_forward_backward():
     freqs = torch.arange(512, device=DEV).float()[:, None] * inv[None, :]
     cos_t, sin_t = freqs.cos().contiguous(), freqs.sin().contiguous()
     q = torch.empty(n, HQ, D, device=DEV, dtype=torch.float16)
-    k = torch.empty(n, HKV, D, device=DEV, dtype=torch.float16)
-    v = torch.empty(n, HKV, D, device=DEV, dtype=torch.float16)
+    group = HQ // HKV
+    k = torch.empty(n, HQ, D, device=DEV, dtype=torch.float16)  # repeated for GQA
+    v = torch.empty(n, HQ, D, device=DEV, dtype=torch.float16)
     K.qkv_rope_fwd_kernel[(n,)](qkv, lq, qkv, lv, cos_t, sin_t, pos, q, k, v, 2.0, HQ=HQ,
-                                HKV=HKV, D=D, BHQ=16, BHKV=2, LORA_Q=True, LORA_K=False,
-                                LORA_V=True)
+                                HKV=HKV, D=D, BHQ=16, BHKV=2, GROUP=group, LORA_Q=True,
+                                LORA_K=False, LORA_V=True)
     cos = torch.cat([cos_t, cos_t], -1)[pos.long()][:, None, :]
     sin = torch.cat([sin_t, sin_t], -1)[pos.long()][:, None, :]
     qf = qkv[:, :HQ * D].float() + 2 * lq.float()
@@ -120,10 +121,9 @@ def test_qkv_rope_forward_backward():
     qf, kf, vf = (t.view(n, -1, D).requires_grad_() for t in (qf, kf, vf))
     qr, kr = _rope_ref(qf, cos, sin), _rope_ref(kf, cos, sin)
     close(q, qr, 2e-3)
-    close(k, kr, 2e-3)
-    close(v, vf, 2e-3)
+    close(k, kr.repeat_interleave(group, dim=1), 2e-3)
+    close(v, vf.repeat_interleave(group, dim=1), 2e-3)
 
-    group = HQ // HKV
     dq = torch.randn(n, HQ, D, device=DEV, dtype=torch.float16)
     dk = torch.randn(n, HQ, D, device=DEV, dtype=torch.float16)
     dv = torch.randn(n, HQ, D, device=DEV, dtype=torch.float16)

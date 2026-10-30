@@ -232,6 +232,12 @@ class Packed:
         self.cos, self.sin = rope.table(self.max_len)
         self.dropout_p = dropout_p
         self.rng = dropout_rng
+        self.lora16_views = None  # per layer: fp16 copies of its LoRA weights (FusedQwen2.step)
+
+    def lora16(self, index, weights):
+        if self.lora16_views is not None:
+            return self.lora16_views[index]
+        return tuple(None if t is None else t.to(torch.float16) for t in weights)
 
     def seed(self):
         return self.rng.randrange(1, 2**31 - 1)
@@ -276,6 +282,20 @@ def _attn_bwd(dout, q, k, v, out, lse, seed, offset, packed, scale):
         packed.cu_seqlens, packed.max_len, packed.max_len, lse, 0.0, seed, offset, 1, False,
         scale=scale)
     return dq[0], dk[0], dv[0]
+
+
+def _split_k_mm(a, b, parts):
+    """a @ b as `parts` accumulated GEMMs over slices of K. For the [tokens, 17920] x
+    [17920, 1536] backward GEMM through the fused gate/up weight, cuBLAS on a T4 picks a
+    slower kernel for the single long-K call (1.93 ms) than for four K=4480 ones (1.70 ms)."""
+    k = a.shape[1]
+    step = k // parts
+    if k % parts or step % 64:
+        return a @ b
+    out = a[:, :step] @ b[:step]
+    for i in range(1, parts):
+        out.addmm_(a[:, i * step:(i + 1) * step], b[i * step:(i + 1) * step])
+    return out
 
 
 def _expand_kv(x, group):
@@ -374,13 +394,15 @@ def _rope_fwd(spec, qkv, lq, lv, packed, lora_scale):
     n = qkv.shape[0]
     dev = qkv.device
     q = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
-    k = torch.empty((n, spec.HKV, spec.D), device=dev, dtype=torch.float16)
-    v = torch.empty((n, spec.HKV, spec.D), device=dev, dtype=torch.float16)
+    # k and v come out repeated for the GQA groups ([n, HQ, D]), ready for the attention kernel
+    k = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
+    v = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
     if n:
         K.qkv_rope_fwd_kernel[(n,)](
             qkv, lq if lq is not None else qkv, qkv, lv if lv is not None else qkv, packed.cos,
             packed.sin, packed.pos, q, k, v, lora_scale, HQ=spec.HQ, HKV=spec.HKV, D=spec.D,
-            BHQ=_pow2(spec.HQ), BHKV=_pow2(spec.HKV), LORA_Q=lq is not None, LORA_K=False,
+            BHQ=_pow2(spec.HQ), BHKV=_pow2(spec.HKV), GROUP=spec.HQ // spec.HKV,
+            LORA_Q=lq is not None, LORA_K=False,
             LORA_V=lv is not None, num_warps=4)
     return q, k, v
 
@@ -448,7 +470,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep):
         lv = xv @ bv_w.t()
     q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
     del qkv, lq, lv
-    k_e, v_e = _expand_kv(k, group), _expand_kv(v, group)
+    k_e, v_e = k, v
     out, lse, aseed, aoffset = _attn_fwd(q, k_e, v_e, packed, spec.scale)
 
     w = dequant([spec.w["o_proj"]], dev)
@@ -485,8 +507,7 @@ class _Layer(torch.autograd.Function):
             raise NotImplementedError("LoRA on k_proj")
         seeds = (packed.seed() if aq_w is not None else 0,
                  packed.seed() if av_w is not None else 0)
-        lora16 = tuple(None if t is None else t.to(torch.float16)
-                       for t in (aq_w, bq_w, av_w, bv_w))
+        lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index + 1)
         h3, _ = _layer_forward(spec, h, packed, lora16, seeds, keep=False)
@@ -506,8 +527,7 @@ class _Layer(torch.autograd.Function):
         C = (HQ + 2 * HKV) * D
         dev = h.device
         dh3 = dh3.contiguous()
-        lora16 = tuple(None if t is None else t.to(torch.float16)
-                       for t in (aq_w, bq_w, av_w, bv_w))
+        lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index - 1)
         with torch.no_grad():
@@ -520,7 +540,7 @@ class _Layer(torch.autograd.Function):
         gu = f.pop("gu")
         _glu_bwd(dm, gu, spec.I)
         del dm
-        db = gu @ f.pop("w_gu")
+        db = _split_k_mm(gu, f.pop("w_gu"), 4)
         del gu
         dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
         del db, dh3
@@ -641,6 +661,32 @@ class FusedQwen2:
         self.lm_w = causal.lm_head.weight
         self.rope = RopeTable(inner.rotary_emb, self.layers[0].D, self.device)
         self.rng = random.Random(seed)
+        # One fp16 buffer for every LoRA weight: refreshed by a single foreach copy per step
+        # instead of four casts per layer in forward and again in backward.
+        self.lora_fp32, shapes = [], []
+        for spec in self.layers:
+            for t in spec.lora_params():
+                if t is not None:
+                    self.lora_fp32.append(t)
+                    shapes.append(t.shape)
+        total = sum(int(torch.Size(sh).numel()) for sh in shapes)
+        self.lora_buf = torch.empty((total,), device=self.device, dtype=torch.float16)
+        self.lora_views, start = [], 0
+        for sh in shapes:
+            n = int(torch.Size(sh).numel())
+            self.lora_views.append(self.lora_buf[start:start + n].view(sh))
+            start += n
+        self.lora16_by_layer, i = [], 0
+        for spec in self.layers:
+            row = []
+            for t in (spec.lora_params()[0], spec.lora_params()[1], spec.lora_params()[4],
+                      spec.lora_params()[5]):
+                if t is None:
+                    row.append(None)
+                else:
+                    row.append(self.lora_views[i])
+                    i += 1
+            self.lora16_by_layer.append(tuple(row))
 
     def offload_weights(self):
         """Keep the layers' NF4 weights in pinned host memory and stream them (WeightStream)."""
@@ -678,6 +724,10 @@ class FusedQwen2:
     def step(self, input_ids, attention_mask, labels, denom, training=True):
         p = self.dropout_p if training else 0.0
         packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, p)
+        if self.lora_views:
+            with torch.no_grad():
+                torch._foreach_copy_(self.lora_views, self.lora_fp32)
+            packed.lora16_views = self.lora16_by_layer
         h = torch.nn.functional.embedding(packed.ids, self.embed).float()
         for spec in self.layers:
             h = _Layer.apply(h, spec, packed, *spec.lora_params())

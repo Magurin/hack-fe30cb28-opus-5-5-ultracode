@@ -6,7 +6,8 @@ the matrix multiplies stay in cuBLAS, the kernels below do everything around the
   nf4_dequant_kernel   NF4 weights with double-quantized absmax -> fp16, one pass
   rms_fwd_kernel       [residual add] + RMSNorm -> fp16, plus the two LoRA-dropout inputs
   rms_bwd_kernel       RMSNorm backward, merging the LoRA-dropout gradients, + residual grad
-  qkv_rope_fwd_kernel  bias'ed qkv + LoRA deltas -> RoPE(q), RoPE(k), v in the attention layout
+  qkv_rope_fwd_kernel  bias'ed qkv + LoRA deltas -> RoPE(q), RoPE(k), v in the attention layout,
+                       k and v already repeated for GQA
   qkv_rope_bwd_kernel  the inverse: attention grads -> fused [dq|dk|dv] for one GEMM, GQA sum
   glu_fwd_kernel       silu(g) * u over the fused [g|u] GEMM output
   glu_bwd_kernel       its backward, written in place as fused [dg|du] for one GEMM
@@ -168,8 +169,11 @@ def rms_bwd_kernel(dy_ptr, tq_ptr, tv_ptr, x_ptr, rstd_ptr, w_ptr, dres_ptr, dx_
 def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lk_ptr, lv_ptr, cos_ptr, sin_ptr, pos_ptr,
                         q_ptr, k_ptr, v_ptr, lora_scale,
                         HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
-                        BHQ: tl.constexpr, BHKV: tl.constexpr,
+                        BHQ: tl.constexpr, BHKV: tl.constexpr, GROUP: tl.constexpr,
                         LORA_Q: tl.constexpr, LORA_K: tl.constexpr, LORA_V: tl.constexpr):
+    """k and v are written already repeated for grouped-query attention: [tokens, HQ, D], kv head
+    j at heads j * GROUP .. j * GROUP + GROUP - 1 (what repeat_kv does), so the attention kernel
+    reads them without a separate expand copy."""
     tok = tl.program_id(0).to(tl.int64)
     HALF: tl.constexpr = D // 2
     C: tl.constexpr = (HQ + 2 * HKV) * D
@@ -201,9 +205,11 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lk_ptr, lv_ptr, cos_ptr, sin_ptr, pos_p
         lrow = lk_ptr + tok * (HKV * D)
         k1 += tl.load(lrow + idx, mask=mk, other=0.0).to(tl.float32) * lora_scale
         k2 += tl.load(lrow + idx + HALF, mask=mk, other=0.0).to(tl.float32) * lora_scale
-    out = k_ptr + tok * (HKV * D)
-    tl.store(out + idx, (k1 * cos - k2 * sin).to(tl.float16), mask=mk)
-    tl.store(out + idx + HALF, (k2 * cos + k1 * sin).to(tl.float16), mask=mk)
+    k1, k2 = (k1 * cos - k2 * sin).to(tl.float16), (k2 * cos + k1 * sin).to(tl.float16)
+    for r in tl.static_range(GROUP):
+        out = k_ptr + tok * (HQ * D) + (hk * GROUP + r) * D + d[None, :]
+        tl.store(out, k1, mask=mk)
+        tl.store(out + HALF, k2, mask=mk)
 
     v1 = tl.load(row + (HQ + HKV) * D + idx, mask=mk, other=0.0).to(tl.float32)
     v2 = tl.load(row + (HQ + HKV) * D + idx + HALF, mask=mk, other=0.0).to(tl.float32)
@@ -211,9 +217,11 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lk_ptr, lv_ptr, cos_ptr, sin_ptr, pos_p
         lrow = lv_ptr + tok * (HKV * D)
         v1 += tl.load(lrow + idx, mask=mk, other=0.0).to(tl.float32) * lora_scale
         v2 += tl.load(lrow + idx + HALF, mask=mk, other=0.0).to(tl.float32) * lora_scale
-    out = v_ptr + tok * (HKV * D)
-    tl.store(out + idx, v1.to(tl.float16), mask=mk)
-    tl.store(out + idx + HALF, v2.to(tl.float16), mask=mk)
+    v1, v2 = v1.to(tl.float16), v2.to(tl.float16)
+    for r in tl.static_range(GROUP):
+        out = v_ptr + tok * (HQ * D) + (hk * GROUP + r) * D + d[None, :]
+        tl.store(out, v1, mask=mk)
+        tl.store(out + HALF, v2, mask=mk)
 
 
 @triton.jit
