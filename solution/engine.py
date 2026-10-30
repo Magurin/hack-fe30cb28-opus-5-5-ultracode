@@ -1,0 +1,512 @@
+"""The training step of Qwen2 + NF4 + LoRA, rebuilt around our kernels.
+
+Instead of running the HF modules (fp32 residual stream and norms, fp32 copies of every
+projection output, (B, T, 151936) logits upcast to fp32), one step goes like this:
+
+1. pad tokens are dropped: the rows of the batch are packed into one (N, H) sequence (N = real
+   tokens), attention runs varlen over the packed rows, so no work and no memory goes to padding;
+2. every decoder layer is one autograd.Function (`_Layer`) that keeps for backward only what the
+   backward needs, in fp16 where the base also rounds to fp16: the fp32 residual, the attention
+   inputs/outputs and the fused [gate | up] GEMM output. NF4 weights are dequantized by our kernel
+   into one reusable buffer, once in forward and once in backward (as bitsandbytes does);
+3. the final norm, lm_head, cross-entropy and the metrics TRL / Soup log (entropy, token accuracy,
+   per-row loss) are one chunked pass (`_Head`): logits exist for a chunk of rows at a time and the
+   gradient w.r.t. the hidden state is formed in the same pass.
+
+The math is the base's: the same fp16 roundings at the same places (projection outputs, attention
+inputs, the MLP product), fp32 for the residual, the norms, RoPE, softmax and the loss. The LoRA
+dropout is regenerated from a seed in backward instead of being stored.
+"""
+
+import random
+
+import torch
+import triton
+
+from . import kernels as K
+
+NF4_BLOCK = 2048
+GLU_BLOCK = 1024
+CE_BLOCK = 4096
+HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
+
+
+def _cdiv(a, b):
+    return (a + b - 1) // b
+
+
+def _pow2(n):
+    return triton.next_power_of_2(n)
+
+
+# ---------------------------------------------------------------------------------------------
+# NF4 weights
+# ---------------------------------------------------------------------------------------------
+class NF4Weight:
+    """The packed bytes and quant state of one bitsandbytes Linear4bit weight."""
+
+    def __init__(self, param):
+        qs = param.quant_state
+        self.param = param
+        self.shape = tuple(int(s) for s in qs.shape)
+        self.numel = self.shape[0] * self.shape[1]
+        self.code = qs.code.float().contiguous()
+        self.bs1 = int(qs.blocksize)
+        self.nested = bool(qs.nested)
+        if self.nested:
+            self.absmax = qs.absmax
+            self.code2 = qs.state2.code.float().contiguous()
+            self.absmax2 = qs.state2.absmax.float().contiguous()
+            self.offset = torch.as_tensor(qs.offset, device=self.code.device,
+                                          dtype=torch.float32).reshape(1)
+            self.bs2 = int(qs.state2.blocksize)
+        else:
+            self.absmax = qs.absmax.float().contiguous()
+            self.code2 = self.absmax2 = self.offset = self.absmax
+            self.bs2 = 1
+
+    def dequant_into(self, out):
+        K.nf4_dequant_kernel[(_cdiv(self.numel, NF4_BLOCK),)](
+            self.param, self.absmax, self.code2, self.absmax2, self.offset, self.code, out,
+            self.numel, NESTED=self.nested, BS1=self.bs1, BS2=self.bs2, BLOCK=NF4_BLOCK)
+        return out
+
+
+def dequant(weights, device):
+    """Dequantize one or more [n_i, K] weights stacked into one fp16 [sum n_i, K] buffer."""
+    rows = sum(w.shape[0] for w in weights)
+    out = torch.empty((rows, weights[0].shape[1]), device=device, dtype=torch.float16)
+    start = 0
+    for w in weights:
+        w.dequant_into(out[start:start + w.shape[0]])
+        start += w.shape[0]
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-step packing
+# ---------------------------------------------------------------------------------------------
+class Packed:
+    """One micro-batch without its padding: real tokens of every row, back to back."""
+
+    def __init__(self, input_ids, attention_mask, labels, rope, dropout_rng, dropout_p):
+        B, T = input_ids.shape
+        lengths = attention_mask.sum(dim=1)
+        lengths_cpu = lengths.tolist()
+        expected = torch.arange(T, device=input_ids.device)[None, :] < lengths[:, None]
+        if not bool(torch.equal(attention_mask.bool(), expected)):
+            raise ValueError("attention_mask is not right-padded")
+        flat = expected.reshape(-1).nonzero().squeeze(1)
+        self.n = int(flat.numel())
+        self.rows = B
+        self.lengths = [int(x) for x in lengths_cpu]
+        self.max_len = max(self.lengths) if self.lengths else 0
+        self.ids = input_ids.reshape(-1)[flat]
+        self.pos = (flat % T).to(torch.int32)
+        shifted = torch.full_like(labels, -100)
+        shifted[:, :-1] = labels[:, 1:]
+        self.targets = shifted.reshape(-1)[flat].contiguous()
+        cu = [0]
+        for length in self.lengths:
+            cu.append(cu[-1] + length)
+        self.cu_seqlens = torch.tensor(cu, device=input_ids.device, dtype=torch.int32)
+        self.row_of_token = torch.repeat_interleave(
+            torch.arange(B, device=input_ids.device), lengths)
+        self.cos, self.sin = rope.table(self.max_len)
+        self.dropout_p = dropout_p
+        self.rng = dropout_rng
+
+    def seed(self):
+        return self.rng.randrange(1, 2**31 - 1)
+
+
+class RopeTable:
+    """cos / sin of the model's own rotary embedding (first half of head_dim: Qwen2 repeats it)."""
+
+    def __init__(self, rotary, head_dim, device):
+        self.rotary, self.half, self.device = rotary, head_dim // 2, device
+        self.cos = self.sin = None
+
+    def table(self, length):
+        if self.cos is None or self.cos.shape[0] < length:
+            size = max(1024, _pow2(length))
+            dummy = torch.zeros(1, device=self.device, dtype=torch.float32)
+            pos = torch.arange(size, device=self.device)[None, :]
+            with torch.no_grad():
+                cos, sin = self.rotary(dummy, pos)
+            cos, sin = cos[0].float(), sin[0].float()
+            if not (torch.equal(cos[:, :self.half], cos[:, self.half:])
+                    and torch.equal(sin[:, :self.half], sin[:, self.half:])):
+                raise ValueError("rotary table is not rotate_half style")
+            self.cos = cos[:, :self.half].contiguous()
+            self.sin = sin[:, :self.half].contiguous()
+        return self.cos, self.sin
+
+
+# ---------------------------------------------------------------------------------------------
+# Attention: PyTorch's own memory-efficient kernel in its varlen form (cu_seqlens), causal.
+# ---------------------------------------------------------------------------------------------
+def _attn_fwd(q, k, v, packed, scale):
+    out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+        q[None], k[None], v[None], None, packed.cu_seqlens, packed.cu_seqlens, packed.max_len,
+        packed.max_len, 0.0, 1, True, scale=scale)
+    return out[0], lse, seed, offset
+
+
+def _attn_bwd(dout, q, k, v, out, lse, seed, offset, packed, scale):
+    dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
+        dout[None], q[None], k[None], v[None], None, out[None], packed.cu_seqlens,
+        packed.cu_seqlens, packed.max_len, packed.max_len, lse, 0.0, seed, offset, 1, False,
+        scale=scale)
+    return dq[0], dk[0], dv[0]
+
+
+def _expand_kv(x, group):
+    if group == 1:
+        return x
+    n, hkv, d = x.shape
+    return x[:, :, None, :].expand(n, hkv, group, d).reshape(n, hkv * group, d)
+
+
+# ---------------------------------------------------------------------------------------------
+# One decoder layer
+# ---------------------------------------------------------------------------------------------
+class LayerSpec:
+    def __init__(self, layer, config, lora_names):
+        attn, mlp = layer.self_attn, layer.mlp
+        self.H = config.hidden_size
+        self.D = getattr(config, "head_dim", None) or self.H // config.num_attention_heads
+        self.HQ = config.num_attention_heads
+        self.HKV = config.num_key_value_heads
+        self.I = config.intermediate_size
+        self.eps = float(layer.input_layernorm.variance_epsilon)
+        assert float(layer.post_attention_layernorm.variance_epsilon) == self.eps
+        self.ln1 = layer.input_layernorm.weight
+        self.ln2 = layer.post_attention_layernorm.weight
+        self.scale = attn.scaling
+
+        def base_of(module):
+            return getattr(module, "base_layer", module)
+
+        projs = {name: getattr(attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")}
+        projs.update({name: getattr(mlp, name) for name in ("gate_proj", "up_proj", "down_proj")})
+        self.w = {name: NF4Weight(base_of(m).weight) for name, m in projs.items()}
+        biases = [base_of(projs[name]).bias for name in ("q_proj", "k_proj", "v_proj")]
+        self.bias_qkv = torch.cat([b.detach().to(torch.float16) for b in biases]).contiguous()
+        self.lora = {}
+        for short in ("q", "k", "v"):
+            module = projs[f"{short}_proj"]
+            if short in lora_names:
+                name = lora_names[short]
+                self.lora[short] = (module.lora_A[name].weight, module.lora_B[name].weight,
+                                    float(module.scaling[name]))
+
+    def lora_params(self):
+        out = []
+        for short in ("q", "k", "v"):
+            if short in self.lora:
+                out += [self.lora[short][0], self.lora[short][1]]
+            else:
+                out += [None, None]
+        return out
+
+
+def _lora_scale(spec):
+    scales = {value[2] for value in spec.lora.values()}
+    assert len(scales) <= 1
+    return scales.pop() if scales else 1.0
+
+
+def _rms_fwd(spec, x, weight, packed, *, delta=None, write_y=True, seeds=(0, 0),
+             drop_q=False, drop_v=False):
+    n, H = x.shape
+    dev = x.device
+    xsum = torch.empty_like(x) if delta is not None else x
+    y = torch.empty((n, H), device=dev, dtype=torch.float16) if write_y else None
+    yq = torch.empty((n, H), device=dev, dtype=torch.float16) if drop_q else None
+    yv = torch.empty((n, H), device=dev, dtype=torch.float16) if drop_v else None
+    rstd = torch.empty((n,), device=dev, dtype=torch.float32)
+    p = packed.dropout_p
+    if n:
+        K.rms_fwd_kernel[(n,)](
+            x, delta if delta is not None else x, weight, xsum, y if y is not None else x,
+            yq if yq is not None else x, yv if yv is not None else x, rstd, H, spec.eps, p,
+            1.0 / (1.0 - p), seeds[0], seeds[1], HAS_DELTA=delta is not None, WRITE_Y=write_y,
+            DROP_Q=drop_q, DROP_V=drop_v, BLOCK=_pow2(H), num_warps=8)
+    return xsum, y, yq, yv, rstd
+
+
+def _rms_bwd(spec, dy, x, rstd, weight, packed, *, dres=None, tq=None, tv=None, seeds=(0, 0),
+             grad_scale=1.0, out=None):
+    n, H = x.shape
+    dx = out if out is not None else torch.empty_like(x)
+    p = packed.dropout_p
+    if n:
+        K.rms_bwd_kernel[(n,)](
+            dy, tq if tq is not None else dy, tv if tv is not None else dy, x, rstd, weight,
+            dres if dres is not None else x, dx, H, dy.stride(0), p, 1.0 / (1.0 - p),
+            seeds[0], seeds[1], grad_scale, DROP_Q=tq is not None, DROP_V=tv is not None,
+            HAS_RES=dres is not None, BLOCK=_pow2(H), num_warps=8)
+    return dx
+
+
+def _rope_fwd(spec, qkv, lq, lv, packed, lora_scale):
+    n = qkv.shape[0]
+    dev = qkv.device
+    q = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
+    k = torch.empty((n, spec.HKV, spec.D), device=dev, dtype=torch.float16)
+    v = torch.empty((n, spec.HKV, spec.D), device=dev, dtype=torch.float16)
+    if n:
+        K.qkv_rope_fwd_kernel[(n,)](
+            qkv, lq if lq is not None else qkv, qkv, lv if lv is not None else qkv, packed.cos,
+            packed.sin, packed.pos, q, k, v, lora_scale, HQ=spec.HQ, HKV=spec.HKV, D=spec.D,
+            BHQ=_pow2(spec.HQ), BHKV=_pow2(spec.HKV), LORA_Q=lq is not None, LORA_K=False,
+            LORA_V=lv is not None, num_warps=4)
+    return q, k, v
+
+
+def _rope_bwd(spec, dq, dk, dv, packed):
+    n = dq.shape[0]
+    C = (spec.HQ + 2 * spec.HKV) * spec.D
+    dqkv = torch.empty((n, C), device=dq.device, dtype=torch.float16)
+    if n:
+        K.qkv_rope_bwd_kernel[(n,)](
+            dq.contiguous(), dk.contiguous(), dv.contiguous(), packed.cos, packed.sin,
+            packed.pos, dqkv, HQ=spec.HQ, HKV=spec.HKV, D=spec.D, BHQ=_pow2(spec.HQ),
+            BHKV=_pow2(spec.HKV), GROUP=spec.HQ // spec.HKV, num_warps=4)
+    return dqkv
+
+
+def _glu_fwd(gu, I):
+    n = gu.shape[0]
+    m = torch.empty((n, I), device=gu.device, dtype=torch.float16)
+    if n:
+        K.glu_fwd_kernel[(n, _cdiv(I, GLU_BLOCK))](gu, m, I, BLOCK=GLU_BLOCK)
+    return m
+
+
+def _glu_bwd(dm, gu, I):
+    n = gu.shape[0]
+    if n:
+        K.glu_bwd_kernel[(n, _cdiv(I, GLU_BLOCK))](dm, gu, I, BLOCK=GLU_BLOCK)
+
+
+def _ce(logits, targets, tok_loss, entropy, correct):
+    rows, V = logits.shape
+    if rows:
+        K.lm_head_ce_kernel[(rows,)](logits, targets, tok_loss, entropy, correct, V,
+                                     BLOCK=CE_BLOCK, num_warps=8)
+
+
+class _Layer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h, spec, packed, aq_w, bq_w, ak_w, bk_w, av_w, bv_w):
+        n, H = h.shape
+        D, HQ, HKV = spec.D, spec.HQ, spec.HKV
+        group = HQ // HKV
+        dev = h.device
+        has = {"q": aq_w is not None, "k": ak_w is not None, "v": av_w is not None}
+        seeds = (packed.seed() if has["q"] else 0, packed.seed() if has["v"] else 0)
+        lora_scale = _lora_scale(spec)
+
+        # input RMSNorm (+ the dropout'ed copies the LoRA A matrices read)
+        _, a, aq, av, rstd1 = _rms_fwd(spec, h, spec.ln1, packed, seeds=seeds,
+                                       drop_q=has["q"], drop_v=has["v"])
+        if has["k"]:
+            raise NotImplementedError("LoRA on k_proj")
+
+        # q, k, v in one GEMM; LoRA as two thin GEMMs per target
+        w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+        qkv = torch.addmm(spec.bias_qkv, a, w.t())
+        del w
+        xq = xv = lq = lv = None
+        if has["q"]:
+            xq = aq @ aq_w.to(torch.float16).t()
+            lq = xq @ bq_w.to(torch.float16).t()
+        if has["v"]:
+            xv = av @ av_w.to(torch.float16).t()
+            lv = xv @ bv_w.to(torch.float16).t()
+        del aq, av
+        q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
+        del qkv, lq, lv
+
+        out, lse, aseed, aoffset = _attn_fwd(q, _expand_kv(k, group), _expand_kv(v, group),
+                                             packed, spec.scale)
+        w = dequant([spec.w["o_proj"]], dev)
+        o = out.reshape(n, HQ * D) @ w.t()
+        del w
+
+        h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
+        del o
+        w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
+        gu = b @ w.t()
+        del w, b
+        m = _glu_fwd(gu, spec.I)
+        w = dequant([spec.w["down_proj"]], dev)
+        d = m @ w.t()
+        del w, m
+        h3 = torch.add(h2, d)
+
+        ctx.save_for_backward(h, rstd1, h2, rstd2, q, k, v, out, lse, aseed, aoffset, gu,
+                              xq, xv, aq_w, bq_w, av_w, bv_w)
+        ctx.spec, ctx.packed, ctx.seeds, ctx.has, ctx.lora_scale = spec, packed, seeds, has, \
+            lora_scale
+        return h3
+
+    @staticmethod
+    def backward(ctx, dh3):
+        (h, rstd1, h2, rstd2, q, k, v, out, lse, aseed, aoffset, gu, xq, xv,
+         aq_w, bq_w, av_w, bv_w) = ctx.saved_tensors
+        spec, packed, seeds, has, s = ctx.spec, ctx.packed, ctx.seeds, ctx.has, ctx.lora_scale
+        n, H = h.shape
+        D, HQ, HKV = spec.D, spec.HQ, spec.HKV
+        group = HQ // HKV
+        dev = h.device
+        dh3 = dh3.contiguous()
+
+        # MLP
+        w = dequant([spec.w["down_proj"]], dev)
+        dm = dh3.to(torch.float16) @ w
+        del w
+        _glu_bwd(dm, gu, spec.I)
+        del dm
+        w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
+        db = gu @ w
+        del w, gu
+        dh2 = _rms_bwd(spec, db, h2, rstd2, spec.ln2, packed, dres=dh3)
+        del db
+
+        # attention
+        w = dequant([spec.w["o_proj"]], dev)
+        dout = (dh2.to(torch.float16) @ w).view(n, HQ, D)
+        del w
+        dq, dk, dv = _attn_bwd(dout, q, _expand_kv(k, group), _expand_kv(v, group), out, lse,
+                               aseed, aoffset, packed, spec.scale)
+        del dout
+        C = (HQ + 2 * HKV) * D
+        dqkv = _rope_bwd(spec, dq, dk, dv, packed)
+        del dq, dk, dv
+        w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+        da = dqkv @ w
+        del w
+
+        # LoRA: dB = s g^T x, dx = s g B, dA = dx^T drop(a), d drop(a) = dx A
+        grads = {"q": (None, None, None), "v": (None, None, None)}
+        if has["q"] or has["v"]:
+            _, _, aq, av, _ = _rms_fwd(spec, h, spec.ln1, packed, write_y=False, seeds=seeds,
+                                       drop_q=has["q"], drop_v=has["v"])
+            for short, x_lo, a_w, b_w, a_in, cols in (
+                    ("q", xq, aq_w, bq_w, aq, slice(0, HQ * D)),
+                    ("v", xv, av_w, bv_w, av, slice((HQ + HKV) * D, C))):
+                if not has[short]:
+                    continue
+                g = dqkv[:, cols]
+                b16 = b_w.to(torch.float16)
+                db_w = (g.t() @ x_lo).float() * s
+                dx_lo = (g @ b16) * s
+                da_w = (dx_lo.t() @ a_in).float()
+                t = dx_lo @ a_w.to(torch.float16)
+                grads[short] = (da_w, db_w, t)
+            del aq, av
+        del dqkv
+        dh = None
+        if ctx.needs_input_grad[0]:
+            dh = _rms_bwd(spec, da, h, rstd1, spec.ln1, packed, dres=dh2, tq=grads["q"][2],
+                          tv=grads["v"][2], seeds=seeds)
+        return (dh, None, None, grads["q"][0], grads["q"][1], None, None, grads["v"][0],
+                grads["v"][1])
+
+
+# ---------------------------------------------------------------------------------------------
+# Final norm + lm_head + cross-entropy + metrics, chunked
+# ---------------------------------------------------------------------------------------------
+class HeadStats:
+    pass
+
+
+class _Head(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h, norm_w, eps, lm_w, packed, denom, stats):
+        n, H = h.shape
+        V = lm_w.shape[0]
+        dev = h.device
+        spec = HeadStats()
+        spec.eps = eps
+        _, hn, _, _, rstd = _rms_fwd(spec, h, norm_w, packed)
+        dh = torch.empty_like(h)
+        tok_loss = torch.empty((n,), device=dev, dtype=torch.float32)
+        entropy = torch.empty((n,), device=dev, dtype=torch.float32)
+        correct = torch.empty((n,), device=dev, dtype=torch.int32)
+        inv = 1.0 / float(denom)
+        for c0 in range(0, n, HEAD_CHUNK):
+            c1 = min(n, c0 + HEAD_CHUNK)
+            logits = hn[c0:c1] @ lm_w.t()
+            _ce(logits, packed.targets[c0:c1], tok_loss[c0:c1], entropy[c0:c1], correct[c0:c1])
+            dhn = logits @ lm_w
+            del logits
+            _rms_bwd(spec, dhn, h[c0:c1], rstd[c0:c1], norm_w, packed, grad_scale=inv,
+                     out=dh[c0:c1])
+            del dhn
+        ctx.save_for_backward(dh)
+        stats.tok_loss, stats.entropy, stats.correct = tok_loss, entropy, correct
+        return tok_loss.sum() * inv
+
+    @staticmethod
+    def backward(ctx, grad):
+        (dh,) = ctx.saved_tensors
+        return dh * grad, None, None, None, None, None, None
+
+
+# ---------------------------------------------------------------------------------------------
+# The model
+# ---------------------------------------------------------------------------------------------
+class FusedQwen2:
+    """Holds what the step needs from a PEFT-wrapped, 4-bit Qwen2ForCausalLM."""
+
+    def __init__(self, peft_model, seed=0):
+        causal = peft_model.get_base_model()
+        inner = causal.model
+        config = causal.config
+        self.peft_model = peft_model
+        self.config = config
+        self.device = inner.embed_tokens.weight.device
+        lora_names = _lora_targets(inner.layers[0])
+        self.layers = [LayerSpec(layer, config, lora_names) for layer in inner.layers]
+        self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
+        self.norm_w = inner.norm.weight
+        self.eps = float(inner.norm.variance_epsilon)
+        self.embed = inner.embed_tokens.weight
+        self.lm_w = causal.lm_head.weight
+        self.rope = RopeTable(inner.rotary_emb, self.layers[0].D, self.device)
+        self.rng = random.Random(seed)
+
+    def step(self, input_ids, attention_mask, labels, denom, training=True):
+        p = self.dropout_p if training else 0.0
+        packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, p)
+        h = torch.nn.functional.embedding(packed.ids, self.embed).float()
+        for spec in self.layers:
+            h = _Layer.apply(h, spec, packed, *spec.lora_params())
+        stats = HeadStats()
+        lm_w = self.lm_w if self.lm_w.dtype == torch.float16 else self.lm_w.to(torch.float16)
+        loss = _Head.apply(h, self.norm_w, self.eps, lm_w, packed, denom, stats)
+        return loss, packed, stats
+
+
+def _lora_targets(layer):
+    found = {}
+    for short, module in (("q", layer.self_attn.q_proj), ("k", layer.self_attn.k_proj),
+                          ("v", layer.self_attn.v_proj)):
+        names = getattr(module, "active_adapters", None)
+        if names:
+            found[short] = names[0]
+    return found
+
+
+def _lora_dropout(layer, lora_names):
+    ps = set()
+    for short, name in lora_names.items():
+        module = getattr(layer.self_attn, f"{short}_proj")
+        drop = module.lora_dropout[name]
+        ps.add(float(getattr(drop, "p", 0.0)))
+    assert len(ps) <= 1
+    return ps.pop() if ps else 0.0
