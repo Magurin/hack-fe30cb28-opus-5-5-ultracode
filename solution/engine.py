@@ -372,6 +372,18 @@ def _lora_scale(spec):
     return scales.pop() if scales else 1.0
 
 
+def _dummy16(device):
+    """A one-element fp16 tensor standing in for an output or input a launch does not use, so
+    every launch of a kernel has the same argument types (one compiled variant)."""
+    t = _DUMMIES.get(device)
+    if t is None:
+        t = _DUMMIES[device] = torch.empty((8,), device=device, dtype=torch.float16)
+    return t
+
+
+_DUMMIES = {}
+
+
 def _rms_fwd(spec, x, weight, packed, *, delta=None, write_y=True, seeds=(0, 0),
              drop_q=False, drop_v=False):
     n, H = x.shape
@@ -382,12 +394,14 @@ def _rms_fwd(spec, x, weight, packed, *, delta=None, write_y=True, seeds=(0, 0),
     yv = torch.empty((n, H), device=dev, dtype=torch.float16) if drop_v else None
     rstd = torch.empty((n,), device=dev, dtype=torch.float32)
     p = packed.dropout_p
+    dummy = _dummy16(dev)
     if n:
         _launch(K.rms_fwd_kernel, (n,),
-            x, delta if delta is not None else x, weight, xsum, y if y is not None else x,
-            yq if yq is not None else x, yv if yv is not None else x, rstd, H, spec.eps, p,
-            1.0 / (1.0 - p), seeds[0], seeds[1], HAS_DELTA=delta is not None, WRITE_Y=write_y,
-            DROP_Q=drop_q, DROP_V=drop_v, BLOCK=_pow2(H), num_warps=8)
+            x, delta if delta is not None else dummy, weight, xsum,
+            y if y is not None else dummy, yq if yq is not None else dummy,
+            yv if yv is not None else dummy, rstd, H, spec.eps, p, 1.0 / (1.0 - p), seeds[0],
+            seeds[1], int(delta is not None), int(write_y), int(drop_q), int(drop_v),
+            BLOCK=_pow2(H), num_warps=8)
     return xsum, y, yq, yv, rstd
 
 
@@ -400,8 +414,8 @@ def _rms_bwd(spec, dy, x, rstd, weight, packed, *, dres=None, tq=None, tv=None, 
         _launch(K.rms_bwd_kernel, (n,),
             dy, tq if tq is not None else dy, tv if tv is not None else dy, x, rstd, weight,
             dres if dres is not None else x, dx, H, dy.stride(0), p, 1.0 / (1.0 - p),
-            seeds[0], seeds[1], grad_scale, DROP_Q=tq is not None, DROP_V=tv is not None,
-            HAS_RES=dres is not None, BLOCK=_pow2(H), num_warps=8)
+            seeds[0], seeds[1], grad_scale, int(tq is not None), int(tv is not None),
+            int(dres is not None), BLOCK=_pow2(H), num_warps=8)
     return dx
 
 
