@@ -29,6 +29,8 @@ OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (
 # keep the tied embedding / lm_head weight in pinned host memory from the model load on
 # (solution/offload.py, engine.HostHead)
 OFFLOAD_HEAD = True
+# keep the layer inputs the backward needs in pinned host memory (engine.InputStream)
+OFFLOAD_ACTIVATIONS = True
 # put each NF4 layer weight in host memory right after the loader quantizes it (solution/hostload.py)
 HOST_NF4_AT_LOAD = True
 # Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
@@ -41,8 +43,10 @@ KEEP_MARGIN = 112 * 2**20
 EXTRA_MEMORY_MIB = 0
 # With the weights out of the GPU during the load (hostload), the load no longer sets the run's
 # peak; the steps do. If set, the memory (MiB, allocated) the steps may reach while keeping
-# activations, instead of the (would-be) load peak minus KEEP_MARGIN.
-STEP_CAP_MIB = None
+# activations, instead of the (would-be) load peak minus KEEP_MARGIN. With the layer inputs in
+# host memory too, a T4 run of the public rows peaked at 795 / 715 / 635 MiB with 591 (the
+# would-be load rule) / 500 / 420, loop 27.10 / 27.28 / 27.53 s: 420 gives up 160 MiB for 0.4 s.
+STEP_CAP_MIB = 420
 
 
 def _restore_callback_base():
@@ -210,6 +214,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         engine.offload_weights()
     if not (OFFLOAD_HEAD and engine.offload_head()):
         engine.restore_head()  # an embedding the loader left in host memory goes back
+    if OFFLOAD_ACTIVATIONS:
+        engine.offload_inputs()
     from .engine import UnsupportedBatch
 
     try:

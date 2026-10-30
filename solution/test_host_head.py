@@ -221,3 +221,40 @@ def test_host_head_after_training_forward(tmp_path):
         after = model(input_ids=ids).logits.float()
     assert embed.is_cuda
     assert torch.equal(before, after)
+
+
+@pytest.mark.parametrize("slots,cap,layers", [(1, None, 2), (2, None, 2), (1, 1 << 40, 2),
+                                               (3, None, 7), (3, 1 << 40, 7)])
+def test_layer_inputs_in_host_memory_are_exact(tmp_path, monkeypatch, slots, cap, layers):
+    """Layer inputs kept in pinned host memory (InputStream) give bit-identical loss and LoRA
+    gradients to inputs kept on the GPU, with the weights streamed and the head on the host too,
+    over two steps (the host buffer is reused); also with every intermediate kept (cap). With 7
+    layers and the ring of 3 the slots are written again and the backward fetches ahead."""
+    from solution.engine import FusedQwen2, InputStream
+    from solution.patch import _embedding_to_fp16
+
+    monkeypatch.setattr(InputStream, "SLOTS", slots)
+    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(inputs_on_host):
+        engine = FusedQwen2(model, seed=11)
+        engine.offload_weights()
+        engine.offload_head()
+        if inputs_on_host:
+            engine.offload_inputs()
+        if cap:
+            engine.set_memory_cap(cap)
+        out = []
+        for ids, mask, labels in batches:
+            loss, _, _ = engine.step(ids, mask, labels, 80.0)
+            out.append((loss, torch.autograd.grad(loss, params)))
+        engine.restore_weights()
+        return out
+
+    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
+        assert torch.equal(loss_a, loss_b)
+        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))

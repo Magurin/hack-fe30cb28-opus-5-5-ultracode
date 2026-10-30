@@ -229,12 +229,12 @@ def test_varlen_attention_matches_sdpa():
 # The whole step on a small random Qwen2, 4-bit + LoRA, against the HF/PEFT path under fp16
 # autocast (what Soup runs on a T4).
 # ---------------------------------------------------------------------------------------------
-def _tiny_model(tmp_path, dropout):
+def _tiny_model(tmp_path, dropout, layers=2):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig, Qwen2Config
 
     config = Qwen2Config(vocab_size=3000, hidden_size=256, intermediate_size=640,
-                         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                         num_hidden_layers=layers, num_attention_heads=4, num_key_value_heads=2,
                          max_position_embeddings=512, tie_word_embeddings=True)
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_config(config)
