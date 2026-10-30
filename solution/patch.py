@@ -294,17 +294,13 @@ def install(trainer, seed=0):
 
 
 def patch_library_overheads():
-    """Two pieces of work the `soup train` command does twice or for nothing, done once:
+    """`importlib.metadata.packages_distributions()` walks every installed distribution (2.3 s on
+    the Kaggle image, and nothing caches it). transformers calls it at import and keeps the
+    result in `PACKAGE_DISTRIBUTION_MAPPING`; trl's import calls it again. Later callers get a
+    fresh copy of a snapshot of that same mapping.
 
-    - `importlib.metadata.packages_distributions()` walks every installed distribution (2.3 s
-      on the Kaggle image, and nothing caches it). transformers calls it at import and keeps the
-      result in `PACKAGE_DISTRIBUTION_MAPPING`; trl's import calls it again. Later callers get a
-      fresh copy of a snapshot of that same mapping;
-    - `datasets.Dataset.map` on an in-memory dataset hashes the transform with dill to name a
-      cache file it never writes (no `cache_files`); the transforms here close over the
-      tokenizer, so that is the whole 151,936-token vocabulary pickled per call. For such a
-      dataset we hand `map` a random fingerprint, as `datasets` itself does when hashing fails.
-      The mapped rows are the same; only the fingerprint string, which nothing reads, differs.
+    (A random `new_fingerprint` for in-memory `datasets.Dataset.map` was dropped: the organizers
+    count it as a change of the data, t.me/souptasterschat/1548.)
     """
     import importlib.metadata as metadata
 
@@ -326,24 +322,6 @@ def patch_library_overheads():
         original_packages_distributions = metadata.packages_distributions
         packages_distributions._soup_kernels_patched = True
         metadata.packages_distributions = packages_distributions
-
-    try:
-        from datasets import Dataset
-        from datasets.fingerprint import generate_random_fingerprint
-    except Exception:  # noqa: BLE001
-        return
-    if getattr(Dataset.map, "_soup_kernels_patched", False):
-        return
-    original_map = Dataset.map
-
-    @functools.wraps(original_map)
-    def map_(self, *args, **kwargs):
-        if kwargs.get("new_fingerprint") is None and len(args) < 18 and not self.cache_files:
-            kwargs["new_fingerprint"] = generate_random_fingerprint()
-        return original_map(self, *args, **kwargs)
-
-    map_._soup_kernels_patched = True
-    Dataset.map = map_
 
 
 def patch_soup():
