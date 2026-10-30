@@ -10,6 +10,7 @@ the training step loads each module in a few milliseconds. A variant the warm-up
 compiled on first use as usual.
 """
 
+import contextlib
 import os
 import sys
 import threading
@@ -38,6 +39,36 @@ def _lower_priority():
         os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
     except (AttributeError, OSError):
         pass
+
+
+@contextlib.contextmanager
+def _unoptimized_c_builds():
+    """Build Triton's small C modules (the kernel launchers, the driver helpers) with -O0 while
+    the warm-up compiles, through Triton's `knobs.build.impl` hook: gcc takes the last -O flag,
+    and -O0 makes the warm-up ~1.5 s shorter on a Kaggle CPU (the first step waits for it less
+    often). A launcher only unpacks the arguments and calls cuLaunchKernelEx, so the training
+    loop does not get measurably slower. A hook someone else installed is left alone."""
+    from triton import knobs
+    from triton.runtime import build
+
+    def impl(name, src, srcdir, library_dirs, include_dirs, libraries):
+        knobs.build.impl = None  # Triton's own build below, not this hook again
+        try:
+            return build._build(name, src, srcdir, library_dirs, include_dirs, libraries,
+                                ["-O0"])
+        except TypeError:  # another Triton version: its own build as it is
+            return build._build(name, src, srcdir, library_dirs, include_dirs, libraries)
+        finally:
+            knobs.build.impl = impl
+
+    if knobs.build.impl is not None:
+        yield
+        return
+    knobs.build.impl = impl
+    try:
+        yield
+    finally:
+        knobs.build.impl = None
 
 
 def _run(dims, dropout_p):
@@ -108,8 +139,9 @@ def _run(dims, dropout_p):
             lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
                                 empty(1, HKV * D, dtype=f16), packed, 2.0),
             lambda: E._rope_bwd(spec, grads, grads, grads, packed)]
-    with ThreadPoolExecutor(max_workers=COMPILE_THREADS, thread_name_prefix="solution-compile",
-                            initializer=_lower_priority) as pool:
+    with (_unoptimized_c_builds(),
+          ThreadPoolExecutor(max_workers=COMPILE_THREADS, thread_name_prefix="solution-compile",
+                             initializer=_lower_priority) as pool):
         for future in [pool.submit(compile_only, job) for job in jobs]:
             future.result()
 
