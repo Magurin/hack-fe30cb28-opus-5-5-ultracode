@@ -28,7 +28,7 @@ import triton
 
 from . import kernels as K
 
-NF4_BLOCK = 2048
+NF4_ROWS = 32  # quantization blocks (of 64 values) per program
 GLU_BLOCK = 1024
 CE_BLOCK = 4096
 HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
@@ -56,6 +56,10 @@ class NF4Weight:
         self.numel = self.shape[0] * self.shape[1]
         self.code = qs.code.float().contiguous()
         self.bs1 = int(qs.blocksize)
+        if self.numel % self.bs1:
+            raise ValueError("weight size is not a whole number of quantization blocks")
+        levels = torch.tensor(K.NF4_LEVELS, dtype=torch.float32, device=self.code.device)
+        self.standard = bool(torch.equal(self.code, levels))
         self.nested = bool(qs.nested)
         if self.nested:
             self.absmax = qs.absmax
@@ -70,9 +74,11 @@ class NF4Weight:
             self.bs2 = 1
 
     def dequant_into(self, out):
-        K.nf4_dequant_kernel[(_cdiv(self.numel, NF4_BLOCK),)](
+        blocks = self.numel // self.bs1
+        K.nf4_dequant_kernel[(_cdiv(blocks, NF4_ROWS),)](
             self.packed, self.absmax, self.code2, self.absmax2, self.offset, self.code, out,
-            self.numel, NESTED=self.nested, BS1=self.bs1, BS2=self.bs2, BLOCK=NF4_BLOCK)
+            blocks, NESTED=self.nested, STANDARD_NF4=self.standard, BS1=self.bs1, BS2=self.bs2,
+            ROWS=NF4_ROWS, num_warps=4)
         return out
 
 

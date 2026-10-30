@@ -18,7 +18,7 @@ def close(a, b, tol):
 
 
 @pytest.mark.parametrize("nested", [True, False])
-@pytest.mark.parametrize("shape", [(256, 1536), (1536, 512)])
+@pytest.mark.parametrize("shape", [(256, 1536), (1536, 512), (17920, 1536)])
 def test_nf4_dequant_matches_bitsandbytes(nested, shape):
     import bitsandbytes.functional as F
 

@@ -22,29 +22,76 @@ quantization layout from bitsandbytes / QLoRA (Dettmers et al., 2023, arXiv:2305
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 # --------------------------------------------------------------------------------------------
 # NF4 -> fp16. Element i of a [N, K] weight lives in byte i // 2 (high nibble for even i), its
 # absmax is code2[absmax_q[i // BS1]] * absmax2[i // (BS1 * BS2)] + offset (double quant).
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["n_out"])
+# The 16 NF4 levels (QLoRA, bitsandbytes' `quant_state.code` for quant_type="nf4"), as fp32.
+NF4_LEVELS = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+              -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+              0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+              0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0)
+
+
+@triton.jit
+def _nf4_level(n):
+    """NF4 code -> level with a select tree on constants: no table loads (on Turing the per-
+    element gathers, not the bytes, were what limited the first version of this kernel)."""
+    b0 = (n & 1) != 0
+    b1 = (n & 2) != 0
+    b2 = (n & 4) != 0
+    l0 = tl.where(b0, -0.6961928009986877, -1.0)
+    l1 = tl.where(b0, -0.39491748809814453, -0.5250730514526367)
+    l2 = tl.where(b0, -0.18477343022823334, -0.28444138169288635)
+    l3 = tl.where(b0, 0.0, -0.09105003625154495)
+    l4 = tl.where(b0, 0.16093020141124725, 0.07958029955625534)
+    l5 = tl.where(b0, 0.33791524171829224, 0.24611230194568634)
+    l6 = tl.where(b0, 0.5626170039176941, 0.44070982933044434)
+    l7 = tl.where(b0, 1.0, 0.7229568362236023)
+    m0 = tl.where(b1, l1, l0)
+    m1 = tl.where(b1, l3, l2)
+    m2 = tl.where(b1, l5, l4)
+    m3 = tl.where(b1, l7, l6)
+    lo = tl.where(b2, m1, m0)
+    hi = tl.where(b2, m3, m2)
+    return tl.where((n & 8) != 0, hi, lo)
+
+
+@triton.jit(do_not_specialize=["n_blocks"])
 def nf4_dequant_kernel(packed_ptr, absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr,
-                       out_ptr, n_out, NESTED: tl.constexpr, BS1: tl.constexpr,
-                       BS2: tl.constexpr, BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    inside = offs < n_out
-    byte = tl.load(packed_ptr + offs // 2, mask=inside, other=0).to(tl.int32)
-    nibble = (byte >> (4 - 4 * (offs % 2))) & 15
-    level = tl.load(nf4_ptr + nibble)
-    block = offs // BS1
+                       out_ptr, n_blocks, NESTED: tl.constexpr, STANDARD_NF4: tl.constexpr,
+                       BS1: tl.constexpr, BS2: tl.constexpr, ROWS: tl.constexpr):
+    """A tile of ROWS quantization blocks of BS1 values (BS1 / 2 bytes each): one absmax per
+    block, both nibbles of every byte from one load, output written as one contiguous tile."""
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    inside = rows < n_blocks
+    HALF: tl.constexpr = BS1 // 2
+    cols = tl.arange(0, HALF)
+    byte = tl.load(packed_ptr + rows[:, None].to(tl.int64) * HALF + cols[None, :],
+                   mask=inside[:, None], other=0).to(tl.int32)
     if NESTED:
-        q = tl.load(absmax_ptr + block, mask=inside, other=0).to(tl.int32)
-        scale = tl.load(code2_ptr + q) * tl.load(absmax2_ptr + block // BS2, mask=inside, other=0.0)
+        q = tl.load(absmax_ptr + rows, mask=inside, other=0).to(tl.int32)
+        # rounded product, then the add: bitsandbytes does them as two operations, and a fused
+        # multiply-add would differ in the last bit now and then
+        scale = libdevice.mul_rn(tl.load(code2_ptr + q),
+                                 tl.load(absmax2_ptr + rows // BS2, mask=inside, other=0.0))
         scale = scale + tl.load(offset_ptr)
     else:
-        scale = tl.load(absmax_ptr + block, mask=inside, other=0.0)
-    tl.store(out_ptr + offs, (level * scale).to(tl.float16), mask=inside)
+        scale = tl.load(absmax_ptr + rows, mask=inside, other=0.0)
+    if STANDARD_NF4:
+        first = _nf4_level(byte >> 4)
+        second = _nf4_level(byte & 15)
+    else:
+        first = tl.load(nf4_ptr + (byte >> 4))
+        second = tl.load(nf4_ptr + (byte & 15))
+    first = first * scale[:, None]
+    second = second * scale[:, None]
+    vals = tl.reshape(tl.join(first, second), (ROWS, BS1))  # element 2j <- high nibble of byte j
+    out = out_ptr + rows[:, None].to(tl.int64) * BS1 + tl.arange(0, BS1)[None, :]
+    tl.store(out, vals.to(tl.float16), mask=inside[:, None])
 
 
 # --------------------------------------------------------------------------------------------
