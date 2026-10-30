@@ -29,6 +29,9 @@ OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (
 # load during training; with 64 MiB a T4 run peaked 36 MiB above the load peak, with 112 MiB it
 # stays at it, at no measurable cost in time (an empty_cache() per step instead cost ~6%).
 KEEP_MARGIN = 112 * 2**20
+# Memory the steps may use above the model-load peak to keep activations instead of recomputing
+# them (0: the run's peak stays the model load).
+EXTRA_MEMORY_MIB = 0
 
 
 def _restore_callback_base():
@@ -274,7 +277,8 @@ def install(trainer, seed=0):
     engine = FusedQwen2(model, seed=seed)
     # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
     # margin for allocator slack) to keep activations instead of recomputing them.
-    engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN)
+    engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN
+                          + EXTRA_MEMORY_MIB * 2**20)
     trainer._soup_original_compute_loss = trainer.compute_loss
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)

@@ -248,6 +248,7 @@ class Packed:
         self.rng = dropout_rng
         self.lora16_views = None  # per layer: fp16 copies of its LoRA weights (FusedQwen2.step)
         self.keep_gu_from = 1 << 30  # layers from this index on keep [gate | up] for backward
+        self.keep_all_from = 1 << 30  # ... and from this one every intermediate
 
     def lora16(self, index, weights):
         if self.lora16_views is not None:
@@ -469,10 +470,11 @@ def _ce(logits, targets, tok_loss, entropy, correct, zero_unsupervised=True):
                 int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
 
 
-def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False):
-    """One decoder layer forward. With keep=True also returns what the backward reads; a `gu`
-    kept from the forward replaces the gate/up GEMM. Without keep, returns h3 and, with
-    return_gu, the [gate | up] GEMM output."""
+def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False, full=False):
+    """One decoder layer forward. With keep=True (the backward's recomputation) returns what the
+    backward reads, dequantized weights included; a `gu` kept from the forward replaces the
+    gate/up GEMM. Otherwise returns h3 and, with return_gu, the [gate | up] GEMM output, or with
+    full, every intermediate the backward reads (without the weights)."""
     n, H = h.shape
     D, HQ, HKV = spec.D, spec.HQ, spec.HKV
     group = HQ // HKV
@@ -515,9 +517,11 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     if gu is None:
         gu = b @ w.t()
     del b
-    if keep:
-        saved.update(w_gu=w, rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e,
+    if keep or full:
+        saved.update(rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e,
                      out=out, lse=lse, aseed=aseed, aoffset=aoffset, h2=h2, rstd2=rstd2, gu=gu)
+    if keep:
+        saved["w_gu"] = w
         return None, saved
     del w, aq, av, q, k, v, k_e, v_e, out, lse
     m = _glu_fwd(gu, spec.I)
@@ -526,7 +530,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     w = dequant([spec.w["down_proj"]], dev)
     d = m @ w.t()
     del w, m
-    return torch.add(h2, d), gu
+    return torch.add(h2, d), (saved if full else gu)
 
 
 class _Layer(torch.autograd.Function):
@@ -543,11 +547,16 @@ class _Layer(torch.autograd.Function):
         lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index + 1)
-        # the [gate | up] GEMM output is kept for the last layers when the step has room for it
-        # under the run's peak (FusedQwen2.step); the others recompute it in backward
-        keep_gu = spec.index >= packed.keep_gu_from
-        h3, ctx.kept_gu = _layer_forward(spec, h, packed, lora16, seeds, keep=False,
-                                         return_gu=keep_gu)
+        # What this layer keeps for backward depends on the room the step has (FusedQwen2.step):
+        # the [gate | up] GEMM output first (most recomputation saved per byte), then every
+        # intermediate; the rest is recomputed in backward.
+        ctx.kept_gu = ctx.kept_all = None
+        if spec.index >= packed.keep_all_from:
+            h3, ctx.kept_all = _layer_forward(spec, h, packed, lora16, seeds, keep=False,
+                                              full=True)
+        else:
+            h3, ctx.kept_gu = _layer_forward(spec, h, packed, lora16, seeds, keep=False,
+                                             return_gu=spec.index >= packed.keep_gu_from)
         if spec.stream is not None:
             spec.stream.release(spec.index)
         ctx.save_for_backward(h, aq_w, bq_w, av_w, bv_w)
@@ -567,9 +576,12 @@ class _Layer(torch.autograd.Function):
         lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index - 1)
-        with torch.no_grad():
-            _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=ctx.kept_gu)
-        ctx.kept_gu = None
+        if ctx.kept_all is not None:  # nothing to recompute; the weights are dequantized below
+            f, ctx.kept_all = ctx.kept_all, None
+        else:
+            with torch.no_grad():
+                _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=ctx.kept_gu)
+            ctx.kept_gu = None
 
         # MLP
         w = dequant([spec.w["down_proj"]], dev)
@@ -578,19 +590,27 @@ class _Layer(torch.autograd.Function):
         gu = f.pop("gu")
         _glu_bwd(dm, gu, spec.I)
         del dm
-        db = _split_k_mm(gu, f.pop("w_gu"), 4)
+        w = f.pop("w_gu") if "w_gu" in f else dequant([spec.w["gate_proj"], spec.w["up_proj"]],
+                                                       dev)
+        db = _split_k_mm(gu, w, 4)
+        del w
         del gu
         dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
         del db, dh3
 
         # attention
-        dout = (dh2.to(torch.float16) @ f.pop("w_o")).view(n, HQ, D)
+        w = f.pop("w_o") if "w_o" in f else dequant([spec.w["o_proj"]], dev)
+        dout = (dh2.to(torch.float16) @ w).view(n, HQ, D)
+        del w
         dq, dk, dv = _attn_bwd(dout, f.pop("q"), f.pop("k_e"), f.pop("v_e"), f.pop("out"),
                                f.pop("lse"), f.pop("aseed"), f.pop("aoffset"), packed, spec.scale)
         del dout
         dqkv = _rope_bwd(spec, dq, dk, dv, packed)
         del dq, dk, dv
-        da = dqkv @ f.pop("w_qkv")
+        w = f.pop("w_qkv") if "w_qkv" in f else dequant(
+            [spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+        da = dqkv @ w
+        del w
 
         # LoRA: dB = s g^T x, dx = s g B, dA = dx^T drop(a), d drop(a) = dx A
         grads = {"q": (None, None, None), "v": (None, None, None)}
@@ -730,6 +750,29 @@ class FusedQwen2:
         """The step may keep activations as long as its predicted peak stays under this."""
         self.memory_cap = cap_bytes
 
+    def keep_plan(self, n):
+        """(layers keeping [gate | up], layers keeping every intermediate) for a step of n
+        tokens: [gate | up] first (its GEMM is most of the recomputation), and once every layer
+        has it, the remaining intermediates (attention inputs and output, the residual after
+        attention, the dropout'ed LoRA inputs) - each within the cap."""
+        k_gu = self.layers_to_keep(n)
+        L = len(self.layers)
+        if k_gu < L or not n:
+            return k_gu, 0
+        spec = self.layers[0]
+        cap = self.memory_cap
+        left = cap - self._predicted_peak(n) - L * n * 2 * spec.I * 2
+        per_layer = n * (2 * spec.H * 2 + 4 * spec.HQ * spec.D * 2 + spec.H * 4 + 4 * spec.HQ
+                         + 256)
+        return k_gu, max(0, min(L, left // per_layer))
+
+    def _predicted_peak(self, n):
+        spec = self.layers[0]
+        H, I, L = spec.H, spec.I, len(self.layers)
+        weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 3 * I)
+        return torch.cuda.memory_allocated(self.device) + weights + 16 * 2**20 \
+            + n * (L * H * 4 + 100 * 1024)
+
     def layers_to_keep(self, n):
         """How many layers can keep their [gate | up] output (2 * I fp16 values per token) instead
         of recomputing that GEMM in backward, without the step's peak reaching the cap.
@@ -742,13 +785,9 @@ class FusedQwen2:
         cap = getattr(self, "memory_cap", None)
         if not cap or not n:
             return 0
-        spec = self.layers[0]
-        H, I, L = spec.H, spec.I, len(self.layers)
-        weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 3 * I)
-        predicted = torch.cuda.memory_allocated(self.device) + weights + 16 * 2**20 \
-            + n * (L * H * 4 + 100 * 1024)
+        I, L = self.layers[0].I, len(self.layers)
         per_layer = n * 2 * I * 2
-        return max(0, min(L, (cap - predicted) // per_layer))
+        return max(0, min(L, (cap - self._predicted_peak(n)) // per_layer))
 
     def offload_weights(self):
         """Keep the layers' NF4 weights in pinned host memory and stream them (WeightStream)."""
@@ -790,7 +829,9 @@ class FusedQwen2:
             with torch.no_grad():
                 torch._foreach_copy_(self.lora_views, self.lora_fp32)
             packed.lora16_views = self.lora16_by_layer
-        packed.keep_gu_from = len(self.layers) - self.layers_to_keep(packed.n)
+        k_gu, k_all = self.keep_plan(packed.n)
+        packed.keep_gu_from = len(self.layers) - k_gu
+        packed.keep_all_from = len(self.layers) - k_all
         h = torch.nn.functional.embedding(packed.ids, self.embed).float()
         for spec in self.layers:
             h = _Layer.apply(h, spec, packed, *spec.lora_params())

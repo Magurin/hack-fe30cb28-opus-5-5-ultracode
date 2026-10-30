@@ -376,3 +376,31 @@ def test_keeping_gate_up_is_exact(tmp_path):
     loss_b, grads_b = run(1 << 40)
     assert torch.equal(loss_a, loss_b)
     assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
+def test_keeping_everything_is_exact(tmp_path):
+    """Layers that keep every intermediate (no recomputation at all) give bit-identical results
+    to layers that recompute."""
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    torch.manual_seed(4)
+    ids = torch.randint(0, 3000, (3, 21), device=DEV)
+    mask = torch.ones_like(ids)
+    mask[2, 15:] = 0
+    labels = torch.where(mask.bool(), ids, -100)
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(cap):
+        engine = FusedQwen2(model, seed=9)
+        if cap:
+            engine.set_memory_cap(cap)
+            assert engine.keep_plan(57) == (len(engine.layers), len(engine.layers))
+        loss, _, _ = engine.step(ids, mask, labels, 40.0)
+        return loss, torch.autograd.grad(loss, params)
+
+    loss_a, grads_a = run(None)
+    loss_b, grads_b = run(1 << 40)
+    assert torch.equal(loss_a, loss_b)
+    assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
