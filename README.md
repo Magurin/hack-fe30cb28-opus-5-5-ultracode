@@ -472,9 +472,19 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 
 ### Локально (Linux + NVIDIA T4, или другой GPU для тестов)
 
+Официальный замер - на образе Kaggle из шаблонного ноутбука: Python 3.13, torch 2.11.0+cu128,
+triton 3.6.0, datasets 4.8.5 уже стоят в образе, ноутбук доставляет только пакеты Soup (версии из
+`result.json` нашего Kaggle-прогона). Локальная установка должна повторять эти версии: без явного
+закрепления pip сейчас ставит torch 2.15 + triton 3.9 (CUDA 13), а на них мы решение не проверяли.
+Так мы ставили 6 машин Brev T4 (`uv pip install` с теми же аргументами):
+
 ```bash
-pip install "soup-cli[train]==0.77.0" "transformers==5.16.1" "peft==0.20.0" "trl==0.29.1" \
-    "bitsandbytes==0.50.2" "accelerate==1.14.0" pytest
+python3.13 -m venv .venv && . .venv/bin/activate
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.11.0+cu128" "triton==3.6.0" "datasets==4.8.5" \
+    "soup-cli[train]==0.77.0" "transformers==5.16.1" "peft==0.20.0" "trl==0.29.1" \
+    "bitsandbytes==0.50.2" "accelerate==1.14.0" pytest pyyaml
+python -c "import torch, triton; print(torch.__version__, triton.__version__)"   # 2.11.0+cu128 3.6.0
 python task/prepare_data.py
 python -m pytest solution -q          # кернелы против PyTorch, весь шаг против HF + PEFT, откат
 SOUP_APPLY_SOLUTION=1 python -m pytest tests -q -p no:cacheprovider   # 79 тестов Soup с apply() (проверка 10)
