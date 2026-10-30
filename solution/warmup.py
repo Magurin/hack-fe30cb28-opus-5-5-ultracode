@@ -10,6 +10,7 @@ the training step loads each module in a few milliseconds. A variant the warm-up
 compiled on first use as usual.
 """
 
+import os
 import sys
 import threading
 import time
@@ -23,6 +24,17 @@ _timing = {}
 
 class _Dims:
     pass
+
+
+def _lower_priority():
+    """Run this thread (and the ptxas / gcc processes it starts, which inherit its priority) at
+    the lowest CPU priority: the compilation then takes the CPU time the main thread leaves idle
+    instead of slowing down Soup's model load (4 vCPUs on Kaggle are 2 physical cores). On Linux a
+    thread's nice value is its own; elsewhere this does nothing."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+    except (AttributeError, OSError):
+        pass
 
 
 def _run(dims, dropout_p):
@@ -94,7 +106,8 @@ def _run(dims, dropout_p):
             lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
                                 empty(1, HKV * D, dtype=f16), packed, 2.0),
             lambda: E._rope_bwd(spec, grads, grads, grads, packed)]
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="solution-compile") as pool:
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="solution-compile",
+                            initializer=_lower_priority) as pool:
         for future in [pool.submit(compile_only, job) for job in jobs]:
             future.result()
 
@@ -123,6 +136,7 @@ def start(base_model):
             "eps": float(config.rms_norm_eps), "L": config.num_hidden_layers}
 
     def work():
+        _lower_priority()
         started = time.perf_counter()
         try:
             _run(dims, 0.05)
