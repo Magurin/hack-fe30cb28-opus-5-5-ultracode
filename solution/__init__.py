@@ -7,6 +7,14 @@
 
 
 def apply():
+    import sys
+
     from .patch import patch_soup
 
+    try:  # compile our kernels in the background from now on, while Soup sets up
+        from . import warmup
+
+        warmup.start_from_command_line(sys.argv)
+    except Exception as exc:  # noqa: BLE001 - a missed warm-up only costs time
+        print(f"[solution] early kernel warm-up not started ({exc})", file=sys.stderr)
     patch_soup()

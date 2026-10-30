@@ -1,19 +1,24 @@
-"""Compile our kernels while Soup loads the model, instead of during the first training step.
+"""Compile our kernels while Soup sets up and loads the model, not during the first step.
 
 Triton compiles a kernel the first time it is launched with a new signature, and on a Kaggle CPU
-that is about a second per variant; the measured time includes it. Soup spends several seconds
-reading and quantizing the checkpoint before training starts, so a background thread launches
-every kernel variant the step uses once, on tiny tensors, through the very helpers the step
-calls (so the signatures, and therefore Triton's cache keys, are the same). It also touches
-cuBLAS and the attention kernel so their modules are loaded. Nothing it computes is used, and
-the training step does not depend on it: a variant it missed is compiled on first use as usual.
+that is about a second per variant; the measured time includes it. From `apply()` on, background
+threads compile every kernel variant the step uses through the very helpers the step calls (so
+the signatures, and therefore Triton's cache keys, are the same) - compile only: nothing is
+launched, so no CUDA module is loaded onto the GPU while the model loads (module code is device
+memory outside PyTorch's allocator and would add to the run's peak). The first real launch in
+the training step loads each module in a few milliseconds. A variant the warm-up missed is
+compiled on first use as usual.
 """
 
+import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
 _thread = None
+_timing = {}
 
 
 class _Dims:
@@ -22,6 +27,7 @@ class _Dims:
 
 def _run(dims, dropout_p):
     from . import engine as E
+    from . import kernels as K
 
     dev = torch.device("cuda", torch.cuda.current_device())
     spec = _Dims()
@@ -31,56 +37,73 @@ def _run(dims, dropout_p):
     H, I, HQ, HKV, D, V = spec.H, spec.I, spec.HQ, spec.HKV, spec.D, dims["V"]
     packed = _Dims()
     packed.dropout_p = dropout_p
-    packed.cos = torch.ones((1, D // 2), device=dev)
-    packed.sin = torch.zeros((1, D // 2), device=dev)
-    packed.pos = torch.zeros((1,), device=dev, dtype=torch.int32)
-    packed.cu_seqlens = torch.tensor([0, 2], device=dev, dtype=torch.int32)
-    packed.max_len = 2
-    f16 = dict(device=dev, dtype=torch.float16)
-
-    x = torch.randn((1, H), device=dev)
-    w = torch.ones((H,), device=dev)
-    h16 = torch.randn((1, H), **f16)
+    # Only torch.empty below: the warm-up compiles, it launches nothing, so no CUDA module (ours
+    # or PyTorch's) is loaded onto the GPU while the model is being loaded - module code is
+    # device memory outside PyTorch's allocator and would add to the run's nvidia-smi peak.
+    empty = lambda *shape, dtype=torch.float32: torch.empty(shape, device=dev, dtype=dtype)  # noqa: E731
+    packed.cos, packed.sin = empty(1, D // 2), empty(1, D // 2)
+    packed.pos = empty(1, dtype=torch.int32)
+    f16 = torch.float16
+    x, w, rstd = empty(1, H), empty(H), empty(1)
+    h16 = empty(1, H, dtype=f16)
     seeds = (3, 5)
-    # input norm with both LoRA dropouts, post-attention norm with residual, final norm
-    E._rms_fwd(spec, x, w, packed, seeds=seeds, drop_q=True, drop_v=True)
-    E._rms_fwd(spec, x, w, packed, delta=h16)
-    _, _, _, _, rstd = E._rms_fwd(spec, x, w, packed)
-    E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x)
-    E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x, tq=h16, tv=h16, seeds=seeds)
-    E._rms_bwd(spec, h16, x, rstd, w, packed, grad_scale=0.5, out=torch.empty_like(x))
+    qkv = empty(1, (HQ + 2 * HKV) * D, dtype=f16)
+    grads = empty(1, HQ, D, dtype=f16)
 
-    qkv = torch.randn((1, (HQ + 2 * HKV) * D), **f16)
-    q, k, v = E._rope_fwd(spec, qkv, torch.randn((1, HQ * D), **f16),
-                          torch.randn((1, HKV * D), **f16), packed, 2.0)
-    grads = torch.randn((1, HQ, D), **f16)
-    E._rope_bwd(spec, grads, grads, grads, packed)
+    def rms_forward():  # input norm with both LoRA dropouts, post-attention norm, final norm
+        E._rms_fwd(spec, x, w, packed, seeds=seeds, drop_q=True, drop_v=True)
+        E._rms_fwd(spec, x, w, packed, delta=h16)
+        E._rms_fwd(spec, x, w, packed)
 
-    gu = torch.randn((1, 2 * I), **f16)
-    m = E._glu_fwd(gu, I)
-    E._glu_bwd(m, gu, I)
+    def rms_backward():
+        E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x)
+        E._rms_bwd(spec, h16, x, rstd, w, packed, dres=x, tq=h16, tv=h16, seeds=seeds)
+        E._rms_bwd(spec, h16, x, rstd, w, packed, grad_scale=0.5, out=empty(1, H))
 
-    logits = torch.randn((1, V), **f16)
-    E._ce(logits, torch.zeros((1,), device=dev, dtype=torch.long),
-          torch.empty((1,), device=dev), torch.empty((1,), device=dev),
-          torch.empty((1,), device=dev, dtype=torch.int32))
+    def glu():
+        gu = empty(1, 2 * I, dtype=f16)
+        E._glu_bwd(E._glu_fwd(gu, I), gu, I)
 
-    import bitsandbytes.functional as F
+    def ce():
+        E._ce(empty(1, V, dtype=f16), empty(1, dtype=torch.long), empty(1), empty(1),
+              empty(1, dtype=torch.int32))
 
-    packed_w, state = F.quantize_4bit(torch.randn((64, 256), **f16), blocksize=64,
-                                      quant_type="nf4", compress_statistics=True)
-    holder = _Dims()
-    holder.quant_state, holder.data = state, packed_w
-    weight = E.NF4Weight(holder)
-    weight.dequant_into(torch.empty((64, 256), **f16))
+    def nf4():  # the argument types NF4Weight.dequant_into passes for double-quantized weights
+        E._launch(K.nf4_dequant_kernel, (1,), empty(4096, dtype=torch.uint8),
+                  empty(128, dtype=torch.uint8), empty(256), empty(1), empty(1), empty(16),
+                  empty(64, 128, dtype=f16), 128, NESTED=True, STANDARD_NF4=True, BS1=64,
+                  BS2=256, ROWS=E.NF4_ROWS, num_warps=4)
 
-    # cuBLAS fp16 GEMMs and the varlen attention kernels, forward and backward
-    a = torch.randn((2, H), **f16)
-    (a @ torch.randn((H, 64), **f16)).sum()
-    qa = torch.randn((2, HQ, D), **f16)
-    out, lse, s, o = E._attn_fwd(qa, qa, qa, packed, D ** -0.5)
-    E._attn_bwd(torch.randn_like(qa), qa, qa, qa, out, lse, s, o, packed, D ** -0.5)
-    torch.cuda.synchronize(dev)
+    def compile_only(job):
+        E._COMPILE_ONLY.kernels = []
+        try:
+            job()
+            # build the C launchers too (CPU work, cached on disk): the first real launch then
+            # only loads the module onto the GPU
+            from triton.runtime.driver import driver
+
+            for compiled in E._COMPILE_ONLY.kernels:
+                driver.active.launcher_cls(compiled.src, compiled.metadata)
+        finally:
+            E._COMPILE_ONLY.kernels = None
+
+    # One task per @triton.jit function (its variants one after the other), so no two threads
+    # compile into the same kernel's cache; code generation, LLVM and ptxas of different kernels
+    # then overlap.
+    jobs = [rms_forward, rms_backward, glu, ce, nf4,
+            lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
+                                empty(1, HKV * D, dtype=f16), packed, 2.0),
+            lambda: E._rope_bwd(spec, grads, grads, grads, packed)]
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="solution-compile") as pool:
+        for future in [pool.submit(compile_only, job) for job in jobs]:
+            future.result()
+
+    # Pin the host memory the NF4 weights will be streamed from (WeightStream) now: pinning
+    # ~650 MB costs ~0.15 s, and PyTorch's caching host allocator hands the freed block (rounded
+    # up to a power of two) to the same-sized request at the first training step.
+    values = dims["L"] * H * (HQ * D + 2 * HKV * D + HQ * D + 3 * I)
+    pinned = torch.empty((values // 2 + values // 64,), dtype=torch.uint8, pin_memory=True)
+    del pinned
 
 
 def start(base_model):
@@ -97,19 +120,37 @@ def start(base_model):
             "HQ": config.num_attention_heads, "HKV": config.num_key_value_heads,
             "D": getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads,
-            "eps": float(config.rms_norm_eps)}
+            "eps": float(config.rms_norm_eps), "L": config.num_hidden_layers}
 
     def work():
+        started = time.perf_counter()
         try:
             _run(dims, 0.05)
         except Exception as exc:  # noqa: BLE001 - a missed warm-up only costs time
             print(f"[solution] kernel warm-up skipped ({exc.__class__.__name__}: {exc})",
-                  flush=True)
+                  file=sys.stderr, flush=True)
+        _timing["compile_s"] = time.perf_counter() - started
 
     _thread = threading.Thread(target=work, name="solution-kernel-warmup", daemon=True)
     _thread.start()
 
 
+def start_from_command_line(argv):
+    """Start as early as possible: `soup train --config <file>` names the base model in its
+    config, which is all the warm-up needs (Soup reads the same file a moment later)."""
+    if "--config" not in argv or argv.index("--config") + 1 >= len(argv):
+        return
+    import yaml
+
+    with open(argv[argv.index("--config") + 1], encoding="utf-8") as handle:
+        base = (yaml.safe_load(handle) or {}).get("base")
+    if isinstance(base, str):
+        start(base)
+
+
 def wait(timeout=300):
+    """Join the warm-up thread; returns (seconds waited here, seconds the warm-up took)."""
+    started = time.perf_counter()
     if _thread is not None:
         _thread.join(timeout)
+    return time.perf_counter() - started, _timing.get("compile_s")

@@ -22,6 +22,7 @@ dropout is regenerated from a seed in backward instead of being stored.
 """
 
 import random
+import threading
 
 import torch
 import triton
@@ -32,6 +33,19 @@ NF4_ROWS = 32  # quantization blocks (of 64 values) per program
 GLU_BLOCK = 1024
 CE_BLOCK = 4096
 HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
+
+
+_COMPILE_ONLY = threading.local()  # set by solution/warmup.py in its compile threads
+
+
+def _launch(kernel, grid, *args, **kwargs):
+    """Launch a Triton kernel; in a warm-up compile thread, only compile it (no launch, and no
+    module loaded onto the GPU yet) and prepare its launcher."""
+    if getattr(_COMPILE_ONLY, "kernels", None) is None:
+        return kernel[grid](*args, **kwargs)
+    compiled = kernel.warmup(*args, grid=grid, **kwargs)
+    _COMPILE_ONLY.kernels.append(compiled)
+    return compiled
 
 
 def _cdiv(a, b):
@@ -75,7 +89,7 @@ class NF4Weight:
 
     def dequant_into(self, out):
         blocks = self.numel // self.bs1
-        K.nf4_dequant_kernel[(_cdiv(blocks, NF4_ROWS),)](
+        _launch(K.nf4_dequant_kernel, (_cdiv(blocks, NF4_ROWS),),
             self.packed, self.absmax, self.code2, self.absmax2, self.offset, self.code, out,
             blocks, NESTED=self.nested, STANDARD_NF4=self.standard, BS1=self.bs1, BS2=self.bs2,
             ROWS=NF4_ROWS, num_warps=4)
@@ -369,7 +383,7 @@ def _rms_fwd(spec, x, weight, packed, *, delta=None, write_y=True, seeds=(0, 0),
     rstd = torch.empty((n,), device=dev, dtype=torch.float32)
     p = packed.dropout_p
     if n:
-        K.rms_fwd_kernel[(n,)](
+        _launch(K.rms_fwd_kernel, (n,),
             x, delta if delta is not None else x, weight, xsum, y if y is not None else x,
             yq if yq is not None else x, yv if yv is not None else x, rstd, H, spec.eps, p,
             1.0 / (1.0 - p), seeds[0], seeds[1], HAS_DELTA=delta is not None, WRITE_Y=write_y,
@@ -383,7 +397,7 @@ def _rms_bwd(spec, dy, x, rstd, weight, packed, *, dres=None, tq=None, tv=None, 
     dx = out if out is not None else torch.empty_like(x)
     p = packed.dropout_p
     if n:
-        K.rms_bwd_kernel[(n,)](
+        _launch(K.rms_bwd_kernel, (n,),
             dy, tq if tq is not None else dy, tv if tv is not None else dy, x, rstd, weight,
             dres if dres is not None else x, dx, H, dy.stride(0), p, 1.0 / (1.0 - p),
             seeds[0], seeds[1], grad_scale, DROP_Q=tq is not None, DROP_V=tv is not None,
@@ -399,7 +413,7 @@ def _rope_fwd(spec, qkv, lq, lv, packed, lora_scale):
     k = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
     v = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
     if n:
-        K.qkv_rope_fwd_kernel[(n,)](
+        _launch(K.qkv_rope_fwd_kernel, (n,),
             qkv, lq if lq is not None else qkv, qkv, lv if lv is not None else qkv, packed.cos,
             packed.sin, packed.pos, q, k, v, lora_scale, HQ=spec.HQ, HKV=spec.HKV, D=spec.D,
             BHQ=_pow2(spec.HQ), BHKV=_pow2(spec.HKV), GROUP=spec.HQ // spec.HKV,
@@ -413,7 +427,7 @@ def _rope_bwd(spec, dq, dk, dv, packed):
     C = (spec.HQ + 2 * spec.HKV) * spec.D
     dqkv = torch.empty((n, C), device=dq.device, dtype=torch.float16)
     if n:
-        K.qkv_rope_bwd_kernel[(n,)](
+        _launch(K.qkv_rope_bwd_kernel, (n,),
             dq.contiguous(), dk.contiguous(), dv.contiguous(), packed.cos, packed.sin,
             packed.pos, dqkv, HQ=spec.HQ, HKV=spec.HKV, D=spec.D, BHQ=_pow2(spec.HQ),
             BHKV=_pow2(spec.HKV), GROUP=spec.HQ // spec.HKV, num_warps=4)
@@ -424,21 +438,21 @@ def _glu_fwd(gu, I):
     n = gu.shape[0]
     m = torch.empty((n, I), device=gu.device, dtype=torch.float16)
     if n:
-        K.glu_fwd_kernel[(n, _cdiv(I, GLU_BLOCK))](gu, m, I, BLOCK=GLU_BLOCK)
+        _launch(K.glu_fwd_kernel, (n, _cdiv(I, GLU_BLOCK)), gu, m, I, BLOCK=GLU_BLOCK)
     return m
 
 
 def _glu_bwd(dm, gu, I):
     n = gu.shape[0]
     if n:
-        K.glu_bwd_kernel[(n, _cdiv(I, GLU_BLOCK))](dm, gu, I, BLOCK=GLU_BLOCK)
+        _launch(K.glu_bwd_kernel, (n, _cdiv(I, GLU_BLOCK)), dm, gu, I, BLOCK=GLU_BLOCK)
 
 
 def _ce(logits, targets, tok_loss, entropy, correct, zero_unsupervised=True):
     rows, V = logits.shape
     if rows:
-        K.lm_head_ce_kernel[(rows,)](logits, targets, tok_loss, entropy, correct, V,
-                                     int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
+        _launch(K.lm_head_ce_kernel, (rows,), logits, targets, tok_loss, entropy, correct, V,
+                int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
 
 
 def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False):

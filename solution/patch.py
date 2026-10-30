@@ -17,13 +17,18 @@ Anything we do not recognize falls through to the original code untouched.
 
 import functools
 import sys
+import time
 import types
 
 import torch
 
 _INSTALLED_ATTR = "_soup_kernels_engine"
 OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (engine.WeightStream)
-KEEP_MARGIN = 64 * 2**20  # bytes kept free under the load peak when deciding what to keep
+# Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
+# allocates, a long step makes the allocator's reservation grow (fragmentation) and CUDA modules
+# load during training; with 64 MiB a T4 run peaked 36 MiB above the load peak, with 112 MiB it
+# stays at it, at no measurable cost in time (an empty_cache() per step instead cost ~6%).
+KEEP_MARGIN = 112 * 2**20
 
 
 def _restore_callback_base():
@@ -192,43 +197,67 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
             scale //= pc.tp_size
         loss = loss * (scale if self.args.n_gpu <= 1 else self.args.n_gpu)
 
-    # TRL SFTTrainer metrics: entropy over every real token, token accuracy over supervised
-    # next-token targets, running count of real tokens.
+    # TRL SFTTrainer metrics and Soup's rewind rows. The running token count is known on the
+    # host; entropy, accuracy and per-row losses need the step's results, and reading them here
+    # would stall the GPU between forward and backward. They are recorded once backward is
+    # queued (on_pre_optimizer_step, after HF Trainer's own check of the loss has synchronized),
+    # which is still before the optimizer step and the log - same values, same order.
     mode = "train"
-    with torch.no_grad():
-        valid = packed.targets >= 0
-        n_valid = valid.sum()
-        summary = torch.stack([stats.entropy.sum(), stats.correct.sum().float(),
-                               n_valid.float()]).tolist()
-        entropy = summary[0] / max(packed.n, 1)
-        accuracy = summary[1] / summary[2] if summary[2] > 0 else 0.0
-    self._metrics[mode]["entropy"].append(entropy)
+    _flush_metrics(self)  # a previous micro-batch's, if gradient accumulation queued one
+    metrics = self._metrics[mode]
+    metrics["entropy"], metrics["mean_token_accuracy"]  # noqa: B018 - keys in TRL's order
     self._total_train_tokens += int(packed.n)
-    self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
-    self._metrics[mode]["mean_token_accuracy"].append(accuracy)
-
-    # Soup's rewind recorder: per-row mean cross-entropy over supervised tokens.
-    state = getattr(self, "_soup_rewind_state", None)
-    if state is not None and not state.failed:
-        try:
-            with torch.no_grad():
-                rows = packed.rows
-                totals = torch.zeros(rows, device=labels.device, dtype=torch.float32)
-                totals.index_add_(0, packed.row_of_token.index_select(0, stats.order),
-                                  stats.tok_loss)
-                counts = (labels[:, 1:] != -100).sum(dim=1)
-                means = totals / counts.clamp(min=1).to(totals.dtype)
-            state.on_micro_batch(step=int(self.state.global_step) + 1,
-                                 row_loss=[float(x) for x in means.tolist()],
-                                 row_tokens=[int(x) for x in counts.tolist()])
-        except Exception as exc:  # the recorder never raises into training
-            state.fail(exc)
+    metrics["num_tokens"] = [self._total_train_tokens]
+    self._soup_pending_metrics = (packed, stats, labels, int(self.state.global_step) + 1)
 
     if return_outputs:
         from transformers.modeling_outputs import CausalLMOutputWithPast
 
         return loss, CausalLMOutputWithPast(loss=loss, logits=None)
     return loss
+
+
+def _flush_metrics(trainer):
+    """Record the queued micro-batch's TRL metrics and Soup rewind row, as TRL's compute_loss and
+    Soup's RewindTrainer.compute_loss would have."""
+    pending = getattr(trainer, "_soup_pending_metrics", None)
+    if pending is None:
+        return
+    trainer._soup_pending_metrics = None
+    packed, stats, labels, step = pending
+    with torch.no_grad():
+        valid = packed.targets >= 0
+        summary = torch.stack([stats.entropy.sum(), stats.correct.sum().float(),
+                               valid.sum().float()]).tolist()
+    trainer._metrics["train"]["entropy"].append(summary[0] / max(packed.n, 1))
+    trainer._metrics["train"]["mean_token_accuracy"].append(
+        summary[1] / summary[2] if summary[2] > 0 else 0.0)
+
+    # Soup's rewind recorder: per-row mean cross-entropy over supervised tokens.
+    state = getattr(trainer, "_soup_rewind_state", None)
+    if state is not None and not state.failed:
+        try:
+            with torch.no_grad():
+                totals = torch.zeros(packed.rows, device=labels.device, dtype=torch.float32)
+                totals.index_add_(0, packed.row_of_token.index_select(0, stats.order),
+                                  stats.tok_loss)
+                counts = (labels[:, 1:] != -100).sum(dim=1)
+                means = totals / counts.clamp(min=1).to(totals.dtype)
+            state.on_micro_batch(step=step, row_loss=[float(x) for x in means.tolist()],
+                                 row_tokens=[int(x) for x in counts.tolist()])
+        except Exception as exc:  # the recorder never raises into training
+            state.fail(exc)
+
+
+class _FlushMetrics(_restore_callback_base()):
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        _flush_metrics(self.trainer)
+
+    def on_step_end(self, args, state, control, **kwargs):  # in case no optimizer step ran
+        _flush_metrics(self.trainer)
 
 
 def install(trainer, seed=0):
@@ -250,6 +279,7 @@ def install(trainer, seed=0):
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
     trainer.add_callback(_RestoreWeights(engine))
+    trainer.add_callback(_FlushMetrics(trainer))
     mib = 2**20
     _log(f"fused Qwen2 step installed ({len(engine.layers)} layers, LoRA dropout "
          f"{engine.dropout_p}, embedding in fp16: {fp16_embedding}); CUDA memory before "
@@ -344,9 +374,13 @@ def patch_soup():
             try:
                 from . import warmup
 
-                warmup.wait()
+                waited, compile_s = warmup.wait()
+                started = time.perf_counter()
                 seed = int(getattr(getattr(trainer, "args", None), "seed", 0) or 0)
                 installed = install(trainer, seed=seed)
+                _log(f"kernel warm-up took {compile_s or 0:.1f} s in the background; training "
+                     f"waited {waited:.2f} s for it; installing the fused step took "
+                     f"{time.perf_counter() - started:.2f} s")
             except Exception as exc:  # noqa: BLE001 - never break Soup
                 _log(f"not installed ({exc.__class__.__name__}: {exc})")
             if not installed:
