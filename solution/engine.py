@@ -12,7 +12,9 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
    once in backward (as bitsandbytes does); the backward reuses them for the recomputation;
 3. the final norm, lm_head, cross-entropy and the metrics TRL / Soup log (entropy, token accuracy,
    per-row loss) are one chunked pass (`_Head`): logits exist for a chunk of rows at a time and the
-   gradient w.r.t. the hidden state is formed in the same pass.
+   gradient w.r.t. the hidden state is formed in the same pass;
+4. the packed NF4 weights of the layers wait in pinned host memory and are streamed to the GPU
+   one layer ahead of the compute (`WeightStream`).
 
 The math is the base's: the same fp16 roundings at the same places (projection outputs, attention
 inputs, the MLP product), fp32 for the residual, the norms, RoPE, softmax and the loss. The LoRA
@@ -571,7 +573,7 @@ class _Head(torch.autograd.Function):
         tok_loss = torch.empty((n,), device=dev, dtype=torch.float32)
         entropy = torch.empty((n,), device=dev, dtype=torch.float32)
         correct = torch.empty((n,), device=dev, dtype=torch.int32)
-        inv = 1.0 / float(denom)
+        inv = 1.0 / float(denom) if float(denom) else float("nan")  # 0 / 0, as in the base
         for c0 in range(0, n, HEAD_CHUNK):
             c1 = min(n, c0 + HEAD_CHUNK)
             logits = hn[c0:c1] @ lm_w.t()
