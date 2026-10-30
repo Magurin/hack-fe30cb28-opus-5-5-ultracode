@@ -114,6 +114,14 @@ def _run(dims, dropout_p):
         E._ce(empty(1, V, dtype=f16), empty(1, dtype=torch.long), empty(1), empty(1),
               empty(1, dtype=torch.int32))
 
+    def ce_pieces():  # the lm_head streamed from host memory (engine.HostHead)
+        E._ce_piece(empty(1, 8192, dtype=f16), empty(8192, H, dtype=f16),
+                    empty(1, dtype=torch.long), empty(1, 4), empty(1, dtype=torch.int32),
+                    empty(1), empty(1), empty(1, H, dtype=f16), 8192, 5)
+        E._ce_finish(empty(1, 4), empty(1, dtype=torch.int32), empty(1),
+                     empty(1, dtype=torch.long), empty(1), empty(1), empty(1, dtype=torch.int32),
+                     empty(1, H), empty(1, H, dtype=f16), empty(1, H, dtype=f16), 5)
+
     def nf4():  # the argument types NF4Weight.dequant_into passes for double-quantized weights
         E._launch(K.nf4_dequant_kernel, (1,), empty(4096, dtype=torch.uint8),
                   empty(128, dtype=torch.uint8), empty(256), empty(1), empty(1), empty(16),
@@ -135,7 +143,7 @@ def _run(dims, dropout_p):
 
     # One task per @triton.jit function (its variants one after the other), so with several
     # threads no two compile into the same kernel's cache.
-    jobs = [rms_forward, rms_backward, glu, ce, nf4,
+    jobs = [rms_forward, rms_backward, glu, ce, ce_pieces, nf4,
             lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
                                 empty(1, HKV * D, dtype=f16), packed, 2.0),
             lambda: E._rope_bwd(spec, grads, grads, grads, packed)]
@@ -150,6 +158,9 @@ def _run(dims, dropout_p):
     # up to a power of two) to the same-sized request at the first training step.
     values = dims["L"] * H * (HQ * D + 2 * HKV * D + HQ * D + 3 * I)
     pinned = torch.empty((values // 2 + values // 64,), dtype=torch.uint8, pin_memory=True)
+    del pinned
+    # ... and the embedding / lm_head weight (engine.HostHead), if the loader leaves it on the CPU
+    pinned = torch.empty((V, H), dtype=f16, pin_memory=True)
     del pinned
 
 

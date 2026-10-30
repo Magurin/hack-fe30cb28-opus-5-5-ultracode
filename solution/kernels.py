@@ -14,6 +14,9 @@ the matrix multiplies stay in cuBLAS, the kernels below do everything around the
   lm_head_ce_kernel    cross-entropy, entropy, argmax and dlogits over a 151,936-word vocabulary,
                        for a chunk of rows, without materializing anything but the fp16 logits;
                        rows without a target (the prompt) get entropy and argmax only
+  lm_head_piece_kernel the same over one piece of the vocabulary at a time (the lm_head streamed
+                       from host memory), the online state carried from piece to piece
+  lm_head_finish_kernel  loss, entropy, accuracy and the hidden-state gradient after the last piece
 
 Ideas (no code taken): fused RMSNorm and chunked "fused linear cross-entropy" as in Liger-Kernel
 (https://github.com/linkedin/Liger-Kernel) and Unsloth (https://github.com/unslothai/unsloth);
@@ -350,3 +353,90 @@ def lm_head_ce_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, correct_ptr
         for start in range(0, V, BLOCK):
             inside = start + cols < V
             tl.store(src + start + cols, tl.zeros((BLOCK,), tl.float16), mask=inside)
+
+
+# --------------------------------------------------------------------------------------------
+# The same cross-entropy, entropy and argmax over the vocabulary in pieces (the lm_head weight
+# streamed from host memory a piece at a time): the online state (max, sum of exp, sum of
+# exp * logit, best logit and its index) of every row is carried from piece to piece in memory.
+# Pieces start on a multiple of BLOCK, so the blocks, and every operation on them, are the ones
+# lm_head_ce_kernel runs over the whole row. Rows below n_sup (the ones with a target) then get
+# exp(logit - running max) written over their logits for the gradient GEMM, and the factor
+# exp(old max - new max) that rescales what earlier pieces accumulated; the row of the target's
+# lm_head weight is copied out when the target falls in this piece.
+# --------------------------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["n_sup"])
+def lm_head_piece_kernel(logits_ptr, w_ptr, target_ptr, state_ptr, best_idx_ptr, xt_ptr,
+                         alpha_ptr, wt_ptr, v0, width, n_sup, H, BLOCK: tl.constexpr,
+                         HBLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    src = logits_ptr + row * width
+    cols = tl.arange(0, BLOCK)
+    m = tl.load(state_ptr + row * 4)
+    s = tl.load(state_ptr + row * 4 + 1)
+    t = tl.load(state_ptr + row * 4 + 2)
+    best = tl.load(state_ptr + row * 4 + 3)
+    best_idx = tl.load(best_idx_ptr + row)
+    m_old = m
+    for start in range(0, width, BLOCK):
+        inside = start + cols < width
+        x = tl.load(src + start + cols, mask=inside, other=float("-inf")).to(tl.float32)
+        block_max = tl.max(x, axis=0)
+        block_arg = tl.argmax(x, axis=0)
+        best_idx = tl.where(block_max > best, v0 + start + block_arg, best_idx)  # first max wins
+        best = tl.maximum(best, block_max)
+        m_new = tl.maximum(m, block_max)
+        e = tl.where(inside, tl.exp(x - m_new), 0.0)
+        alpha = tl.exp(m - m_new)
+        s = s * alpha + tl.sum(e, axis=0)
+        t = t * alpha + tl.sum(tl.where(inside, e * x, 0.0), axis=0)
+        m = m_new
+    tl.store(state_ptr + row * 4, m)
+    tl.store(state_ptr + row * 4 + 1, s)
+    tl.store(state_ptr + row * 4 + 2, t)
+    tl.store(state_ptr + row * 4 + 3, best)
+    tl.store(best_idx_ptr + row, best_idx)
+    target = tl.load(target_ptr + row)
+    local = target - v0
+    if (target >= 0) & (local >= 0) & (local < width):
+        tl.store(xt_ptr + row, tl.load(src + local).to(tl.float32))
+        hcols = tl.arange(0, HBLOCK)
+        for h0 in range(0, H, HBLOCK):
+            inh = h0 + hcols < H
+            w = tl.load(w_ptr + local * H + h0 + hcols, mask=inh, other=0.0)
+            tl.store(wt_ptr + row * H + h0 + hcols, w, mask=inh)
+    if row < n_sup:
+        tl.store(alpha_ptr + row, tl.exp(m_old - m))
+        for start in range(0, width, BLOCK):
+            inside = start + cols < width
+            x = tl.load(src + start + cols, mask=inside, other=0.0).to(tl.float32)
+            tl.store(src + start + cols, tl.exp(x - m).to(tl.float16), mask=inside)
+
+
+# --------------------------------------------------------------------------------------------
+# After the last piece: loss, entropy and accuracy of every row as lm_head_ce_kernel computes
+# them, and for rows with a target the gradient w.r.t. the normed hidden state,
+# sum_v softmax_v W_v - W_target = acc / s - W_target, in fp16.
+# --------------------------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["n_sup"])
+def lm_head_finish_kernel(state_ptr, best_idx_ptr, xt_ptr, target_ptr, loss_ptr, entropy_ptr,
+                          correct_ptr, acc_ptr, wt_ptr, dh_ptr, n_sup, H, HBLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    m = tl.load(state_ptr + row * 4)
+    s = tl.load(state_ptr + row * 4 + 1)
+    t = tl.load(state_ptr + row * 4 + 2)
+    best_idx = tl.load(best_idx_ptr + row)
+    lse = m + tl.log(s)
+    tl.store(entropy_ptr + row, lse - t / s)
+    target = tl.load(target_ptr + row)
+    valid = target >= 0
+    x_t = tl.load(xt_ptr + row)
+    tl.store(loss_ptr + row, tl.where(valid, lse - x_t, 0.0))
+    tl.store(correct_ptr + row, (valid & (best_idx == target)).to(tl.int32))
+    if row < n_sup:
+        hcols = tl.arange(0, HBLOCK)
+        for h0 in range(0, H, HBLOCK):
+            inh = h0 + hcols < H
+            acc = tl.load(acc_ptr + row * H + h0 + hcols, mask=inh, other=0.0)
+            w = tl.load(wt_ptr + row * H + h0 + hcols, mask=inh, other=0.0).to(tl.float32)
+            tl.store(dh_ptr + row * H + h0 + hcols, (acc / s - w).to(tl.float16), mask=inh)

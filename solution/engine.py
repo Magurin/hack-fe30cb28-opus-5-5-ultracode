@@ -14,7 +14,10 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
    per-row loss) are one chunked pass (`_Head`): logits exist for a chunk of rows at a time and the
    gradient w.r.t. the hidden state is formed in the same pass;
 4. the packed NF4 weights of the layers wait in pinned host memory and are streamed to the GPU
-   one layer ahead of the compute (`WeightStream`).
+   one layer ahead of the compute (`WeightStream`);
+5. the frozen, tied embedding / lm_head weight (445 MiB in fp16) stays in pinned host memory
+   (`HostHead`): the step's embedding rows are gathered on the CPU, the lm_head is streamed in
+   pieces of the vocabulary while the head runs over them (`_head_streamed`).
 
 The math is the base's: the same fp16 roundings at the same places (projection outputs, attention
 inputs, the MLP product), fp32 for the residual, the norms, RoPE, softmax and the loss. The LoRA
@@ -553,6 +556,21 @@ def _ce(logits, targets, tok_loss, entropy, correct, zero_unsupervised=True):
                 int(zero_unsupervised), BLOCK=CE_BLOCK, num_warps=8)
 
 
+def _ce_piece(logits, w, targets, state, best_idx, xt, alpha, wt, v0, n_sup):
+    rows, width = logits.shape
+    if rows:
+        _launch(K.lm_head_piece_kernel, (rows,), logits, w, targets, state, best_idx, xt, alpha,
+                wt, v0, width, n_sup, w.shape[1], BLOCK=CE_BLOCK, HBLOCK=_pow2(w.shape[1]),
+                num_warps=8)
+
+
+def _ce_finish(state, best_idx, xt, targets, tok_loss, entropy, correct, acc, wt, dh, n_sup):
+    rows, H = state.shape[0], acc.shape[1]
+    if rows:
+        _launch(K.lm_head_finish_kernel, (rows,), state, best_idx, xt, targets, tok_loss, entropy,
+                correct, acc, wt, dh, n_sup, H, HBLOCK=_pow2(H), num_warps=4)
+
+
 def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False, full=False,
                    part=None):
     """One decoder layer forward. With keep=True (the backward's recomputation) returns what the
@@ -835,6 +853,155 @@ class _Head(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------------------------
+# The tied embedding / lm_head weight in pinned host memory
+# ---------------------------------------------------------------------------------------------
+class HostHead:
+    """The frozen, tied embedding / lm_head weight (151,936 x 1536 fp16, 445 MiB) stays in pinned
+    host memory for the whole run. The embedding rows of a step are gathered on the CPU and copied
+    over; the lm_head is streamed to the GPU in pieces of PIECE vocabulary rows on a side stream
+    into BUFFERS device buffers, the first ones during the last layers of the forward, the next
+    one as soon as the head is done with a buffer. The buffers only exist from that prefetch to
+    the end of the head."""
+
+    PIECE = 8192  # vocabulary rows per piece (24 MiB); a multiple of the CE kernels' BLOCK
+    BUFFERS = 3
+    PREFETCH_LAYERS = 3  # the copies start once the forward reaches the last this many layers
+
+    def __init__(self, weight, device):
+        self.weight, self.device = weight, device
+        self.V, self.H = weight.shape
+        self.pieces = [(v0, min(self.PIECE, self.V - v0)) for v0 in range(0, self.V, self.PIECE)]
+        self.stream = torch.cuda.Stream(device)
+        self.copied = [torch.cuda.Event() for _ in range(self.BUFFERS)]
+        self.released = [torch.cuda.Event() for _ in range(self.BUFFERS)]
+        self.start = torch.cuda.Event()
+        self.bufs = None
+        self.rows = None  # pinned staging buffer of the embedding rows
+        self.rows_copied = torch.cuda.Event()
+
+    @property
+    def host(self):
+        return self.weight.data
+
+    def embed(self, ids):
+        """fp32 hidden states of the token ids: the fp16 rows gathered on the CPU, copied over."""
+        ids_cpu = ids.cpu()
+        n = ids_cpu.numel()
+        if self.rows is None or self.rows.shape[0] < n:
+            self.rows_copied.synchronize()
+            self.rows = torch.empty((max(n, 2048), self.H), dtype=self.host.dtype,
+                                    pin_memory=True)
+        self.rows_copied.synchronize()  # the previous step's copy has read the staging buffer
+        rows = self.rows[:n]
+        torch.index_select(self.host, 0, ids_cpu, out=rows)
+        out = rows.to(self.device, non_blocking=True)
+        self.rows_copied.record(torch.cuda.current_stream(self.device))
+        return out.float()
+
+    def _copy(self, j):
+        b = j % self.BUFFERS
+        v0, width = self.pieces[j]
+        self.stream.wait_event(self.released[b])
+        with torch.cuda.stream(self.stream):
+            self.bufs[b][:width].copy_(self.host[v0:v0 + width], non_blocking=True)
+            self.copied[b].record(self.stream)
+
+    def prefetch(self):
+        """Start copying the first pieces once the compute stream gets here."""
+        if self.bufs is not None:
+            return
+        self.bufs = [torch.empty((self.PIECE, self.H), device=self.device, dtype=self.host.dtype)
+                     for _ in range(self.BUFFERS)]
+        self.start.record(torch.cuda.current_stream(self.device))
+        self.stream.wait_event(self.start)
+        for j in range(min(self.BUFFERS, len(self.pieces))):
+            self._copy(j)
+
+    def stream_pieces(self):
+        """Yield (first row, rows, device piece) for the whole vocabulary, in order."""
+        self.prefetch()
+        current = torch.cuda.current_stream(self.device)
+        for j, (v0, width) in enumerate(self.pieces):
+            b = j % self.BUFFERS
+            current.wait_event(self.copied[b])
+            yield v0, width, self.bufs[b][:width]
+            self.released[b].record(current)
+            if j + self.BUFFERS < len(self.pieces):
+                self._copy(j + self.BUFFERS)
+        self.bufs = None  # every copy has been waited for: the buffers are free again
+
+    def peak_bytes(self, n):
+        """Device memory of the streamed head over its input: buffers, a piece of logits and
+        the per-row work tensors."""
+        return self.BUFFERS * self.PIECE * self.H * 2 + n * (self.PIECE * 2 + self.H * 24 + 64)
+
+
+def _head_streamed(h, norm_w, eps, head, packed, denom, stats):
+    """_Head.forward with the lm_head weight streamed in pieces of the vocabulary (HostHead):
+    every row's logits of a piece, the online CE state carried over (lm_head_piece_kernel), and
+    for the rows with a target, sum_v exp(logit_v - max) W_v accumulated in fp32, rescaled
+    whenever the running max grows. Loss, entropy and accuracy are lm_head_ce_kernel's to the bit;
+    the gradient is formed with the same fp16 GEMM inputs and fp32 accumulation, in a different
+    order (piece by piece instead of one GEMM over the whole vocabulary)."""
+    n, H = h.shape
+    dev = h.device
+    spec = HeadStats()
+    spec.eps = eps
+    order = packed.head_order
+    n_sup = packed.n_supervised
+    hp = h.index_select(0, order)
+    targets = packed.targets.index_select(0, order)
+    _, hn, _, _, rstd = _rms_fwd(spec, hp, norm_w, packed)
+    state = torch.tensor([float("-inf"), 0.0, 0.0, float("-inf")], device=dev,
+                         dtype=torch.float32).repeat(n, 1)
+    best_idx = torch.zeros((n,), device=dev, dtype=torch.int32)
+    xt = torch.zeros((n,), device=dev, dtype=torch.float32)
+    alpha = torch.empty((max(n_sup, 1),), device=dev, dtype=torch.float32)
+    acc = torch.zeros((max(n_sup, 1), H), device=dev, dtype=torch.float32)
+    wt = torch.zeros((max(n_sup, 1), H), device=dev, dtype=torch.float16)
+    for v0, width, w in head.stream_pieces():
+        logits = hn @ w.t()
+        _ce_piece(logits, w, targets, state, best_idx, xt, alpha, wt, v0, n_sup)
+        if n_sup:
+            acc[:n_sup].mul_(alpha[:n_sup, None])
+            torch.addmm(acc[:n_sup], logits[:n_sup], w, out_dtype=torch.float32,
+                        out=acc[:n_sup])
+        del logits
+    tok_loss = torch.empty((n,), device=dev, dtype=torch.float32)
+    entropy = torch.empty((n,), device=dev, dtype=torch.float32)
+    correct = torch.empty((n,), device=dev, dtype=torch.int32)
+    dhn = torch.empty((max(n_sup, 1), H), device=dev, dtype=torch.float16)
+    _ce_finish(state, best_idx, xt, targets, tok_loss, entropy, correct, acc, wt, dhn, n_sup)
+    del state, best_idx, xt, alpha, acc, wt, hn
+    inv = 1.0 / float(denom) if float(denom) else float("nan")  # 0 / 0, as in the base
+    dhp = torch.empty_like(hp)
+    _rms_bwd(spec, dhn[:n_sup], hp[:n_sup], rstd[:n_sup], norm_w, packed, grad_scale=inv,
+             out=dhp[:n_sup])
+    dhp[n_sup:].zero_()
+    del dhn, hp
+    dh = torch.empty_like(h)
+    dh.index_copy_(0, order, dhp)
+    stats.order, stats.tok_loss = order, tok_loss
+    stats.entropy, stats.correct = entropy, correct
+    return dh, tok_loss.sum() * inv
+
+
+class _HostHead(torch.autograd.Function):
+    """_Head with the lm_head weight in host memory (HostHead)."""
+
+    @staticmethod
+    def forward(ctx, h, norm_w, eps, head, packed, denom, stats):
+        dh, loss = _head_streamed(h, norm_w, eps, head, packed, denom, stats)
+        ctx.save_for_backward(dh)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        (dh,) = ctx.saved_tensors
+        return dh * grad, None, None, None, None, None, None
+
+
+# ---------------------------------------------------------------------------------------------
 # The model
 # ---------------------------------------------------------------------------------------------
 class FusedQwen2:
@@ -846,13 +1013,15 @@ class FusedQwen2:
         config = causal.config
         self.peft_model = peft_model
         self.config = config
-        self.device = inner.embed_tokens.weight.device
+        self.device = inner.norm.weight.device  # the embedding may be in host memory
         lora_names = _lora_targets(inner.layers[0])
         self.layers = [LayerSpec(layer, config, lora_names, i)
                        for i, layer in enumerate(inner.layers)]
         self.base_modules = [spec.base_modules[name] for spec in self.layers
                              for name in spec.base_modules]
         self.stream = None
+        self.head = None  # a HostHead while the embedding / lm_head weight is in host memory
+        self.embed_module = inner.embed_tokens
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
         self.norm_w = inner.norm.weight
         self.eps = float(inner.norm.variance_epsilon)
@@ -914,8 +1083,10 @@ class FusedQwen2:
         # the dequantized qkv, o and [gate | up] weights a recomputing layer's backward holds
         # (down_proj is used and freed before the recomputation)
         weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 2 * I)
-        return (torch.cuda.memory_allocated(self.device) + weights + 48 * 2**20
-                + n * (L * H * 4 + 64 * 1024))
+        work = weights + 48 * 2**20 + n * 64 * 1024
+        if self.head is not None:  # the streamed head runs between the forward and the backward
+            work = max(work, self.head.peak_bytes(n))
+        return torch.cuda.memory_allocated(self.device) + work + n * L * H * 4
 
     def lean(self, n):
         """Whether a step of n tokens needs the lean recomputation to stay under the cap: on the
@@ -961,15 +1132,40 @@ class FusedQwen2:
             for spec in self.layers:
                 spec.stream = self.stream
 
+    def offload_head(self):
+        """Keep the tied embedding / lm_head weight in pinned host memory (HostHead). Only an fp16
+        weight (the one the head's GEMM reads): returns whether it is offloaded."""
+        if self.head is not None:
+            return True
+        weight = self.embed
+        if weight.dtype != torch.float16 or self.lm_w is not weight:
+            return False
+        if not weight.data.is_pinned():
+            host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
+            host.copy_(weight.data)
+            weight.data = host
+            torch.cuda.empty_cache()
+        self.head = HostHead(weight, self.device)
+        return True
+
+    def restore_head(self):
+        """Put the embedding / lm_head weight back on the GPU."""
+        if self.embed.device != self.device:
+            torch.cuda.synchronize(self.device)
+            self.embed.data = self.embed.data.to(self.device)
+        self.head = None
+
     def finish_training(self):
         """Training is over: free the device slots. The weights stay in host memory, which is
-        all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers
-        (if anything runs the model afterwards) brings them back to the GPU first."""
-        if self.stream is None:
+        all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers or of
+        the embedding (if anything runs the model afterwards) brings them back to the GPU first."""
+        self.head = None
+        if self.stream is None and self.embed.device == self.device:
             return
         for spec in self.layers:
             spec.stream = None
-        self.stream.release_slots()
+        if self.stream is not None:
+            self.stream.release_slots()
         hooks = []
 
         def bring_back(module, args):
@@ -977,10 +1173,11 @@ class FusedQwen2:
                 hook.remove()
             self.restore_weights()
 
-        for module in self.base_modules:
+        for module in self.base_modules + [self.embed_module]:
             hooks.append(module.register_forward_pre_hook(bring_back))
 
     def restore_weights(self):
+        self.restore_head()
         if self.stream is not None:
             for spec in self.layers:
                 spec.stream = None
@@ -999,10 +1196,20 @@ class FusedQwen2:
         packed.keep_all_from = len(self.layers) - k_all
         packed.mlp_chunk = self.mlp_chunk
         packed.lean = k_gu == 0 and self.lean(packed.n)
-        h = torch.nn.functional.embedding(packed.ids, self.embed).float()
+        head = self.head
+        if head is not None:
+            h = head.embed(packed.ids)
+        else:
+            h = torch.nn.functional.embedding(packed.ids, self.embed).float()
+        prefetch_at = len(self.layers) - HostHead.PREFETCH_LAYERS
         for spec in self.layers:
+            if head is not None and spec.index == prefetch_at:
+                head.prefetch()
             h = _Layer.apply(h, spec, packed, *spec.lora_params())
         stats = HeadStats()
+        if head is not None:
+            loss = _HostHead.apply(h, self.norm_w, self.eps, head, packed, denom, stats)
+            return loss, packed, stats
         lm_w = self.lm_w if self.lm_w.dtype == torch.float16 else self.lm_w.to(torch.float16)
         loss = _Head.apply(h, self.norm_w, self.eps, lm_w, packed, denom, stats)
         return loss, packed, stats

@@ -22,8 +22,13 @@ import types
 
 import torch
 
+from . import offload
+
 _INSTALLED_ATTR = "_soup_kernels_engine"
 OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (engine.WeightStream)
+# keep the tied embedding / lm_head weight in pinned host memory from the model load on
+# (solution/offload.py, engine.HostHead)
+OFFLOAD_HEAD = True
 # put each NF4 layer weight in host memory right after the loader quantizes it (solution/hostload.py)
 HOST_NF4_AT_LOAD = True
 # Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
@@ -80,7 +85,10 @@ def _is_supported(model):
     inner = getattr(causal, "model", None)
     if inner is None or not hasattr(inner, "layers"):
         return False
-    if not torch.cuda.is_available() or inner.embed_tokens.weight.device.type != "cuda":
+    if not torch.cuda.is_available() or inner.embed_tokens.weight.device.type not in ("cuda",
+                                                                                     "cpu"):
+        return False
+    if inner.norm.weight.device.type != "cuda":
         return False
     for layer in inner.layers:
         attn, mlp = layer.self_attn, layer.mlp
@@ -150,7 +158,7 @@ def patch_prepare_kbit():
         try:
             config = getattr(model, "config", None)
             embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings")                 else None
-            if getattr(config, "model_type", None) == "qwen2" and embed is not None                     and getattr(model, "is_loaded_in_4bit", False)                     and embed.weight.dtype == torch.float16 and embed.weight.is_cuda:
+            if getattr(config, "model_type", None) == "qwen2" and embed is not None                     and getattr(model, "is_loaded_in_4bit", False)                     and embed.weight.dtype == torch.float16:
                 weight = embed.weight
         except Exception:  # noqa: BLE001
             weight = None
@@ -199,6 +207,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
     denom = float(denom.item() if torch.is_tensor(denom) else denom)
     if OFFLOAD_WEIGHTS:
         engine.offload_weights()  # first step: move the NF4 layer weights to pinned host memory
+    if not (OFFLOAD_HEAD and engine.offload_head()):
+        engine.restore_head()  # an embedding the loader left in host memory goes back
     from .engine import UnsupportedBatch
 
     try:
@@ -430,6 +440,8 @@ def patch_soup():
 
     startup.import_without_wandb(sys.argv)  # imports trl, so after the snapshot above
     patch_prepare_kbit()
+    if OFFLOAD_HEAD:
+        offload.patch_model_loading()
     if HOST_NF4_AT_LOAD:
         from . import hostload
 
@@ -478,6 +490,7 @@ def patch_soup():
             from . import hostload
 
             hostload.restore(getattr(trainer, "model", None) or getattr(self, "model", None))
+            offload.restore_embeddings()
         return original_train(self, *args, **kwargs)
 
     train._soup_kernels_patched = True
