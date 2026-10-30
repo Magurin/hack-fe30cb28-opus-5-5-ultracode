@@ -114,10 +114,13 @@ def test_streamed_head_matches_head(n, n_prompt):
         outs.append((loss, stats, dx))
     (loss_a, sa, dx_a), (loss_b, sb, dx_b) = outs
     assert head.bufs is None  # the device buffers are released after the head
-    torch.testing.assert_close(sa.tok_loss, sb.tok_loss, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(sa.entropy, sb.entropy, rtol=1e-5, atol=1e-5)
+    # The streamed head sums the vocabulary in other pieces, so cuBLAS picks other kernels and the
+    # fp32 logsumexp adds in another order: on a T4 one token's loss (~13) moved by 2.5e-4
+    # (1.9e-5 relative). The tolerances below are that rounding, not a change in what is computed.
+    torch.testing.assert_close(sa.tok_loss, sb.tok_loss, rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(sa.entropy, sb.entropy, rtol=1e-4, atol=1e-3)
     assert (sa.correct != sb.correct).sum() <= 1
-    torch.testing.assert_close(loss_a, loss_b, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(loss_a, loss_b, rtol=1e-5, atol=1e-5)
 
     # fp64 reference of the same math (fp16 normed input and weight)
     x = h.double().requires_grad_(True)
