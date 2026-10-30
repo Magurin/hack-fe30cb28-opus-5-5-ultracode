@@ -206,7 +206,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         denom = (labels[:, 1:] != -100).sum()
     denom = float(denom.item() if torch.is_tensor(denom) else denom)
     if OFFLOAD_WEIGHTS:
-        engine.offload_weights()  # first step: move the NF4 layer weights to pinned host memory
+        # a no-op once streaming; again after a fallback to Soup's code brought the weights back
+        engine.offload_weights()
     if not (OFFLOAD_HEAD and engine.offload_head()):
         engine.restore_head()  # an embedding the loader left in host memory goes back
     from .engine import UnsupportedBatch

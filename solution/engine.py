@@ -33,8 +33,8 @@ import triton
 from . import kernels as K
 
 NF4_ROWS = 32  # quantization blocks (of 64 values) per program
-GLU_BLOCK = 1024
-CE_BLOCK = 4096
+GLU_BLOCK = 1024  # columns of the MLP output per SwiGLU program
+CE_BLOCK = 4096  # vocabulary entries per loop iteration of the cross-entropy kernel
 HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
 MLP_CHUNK = 512  # tokens of [gate | up] alive at a time in a lean step (FusedQwen2.keep_plan)
 
@@ -583,8 +583,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     rstd and the MLP input b; part="attention" returns what the attention and LoRA backward read.
     Its forward runs the MLP over MLP_CHUNK tokens at a time."""
     n, H = h.shape
-    D, HQ, HKV = spec.D, spec.HQ, spec.HKV
-    group = HQ // HKV
+    D, HQ = spec.D, spec.HQ
     dev = h.device
     aq_w, bq_w, av_w, bv_w = lora16
     lora_scale = _lora_scale(spec)
