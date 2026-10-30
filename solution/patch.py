@@ -348,6 +348,9 @@ def patch_library_overheads():
 
 def patch_soup():
     patch_library_overheads()
+    from . import startup
+
+    startup.import_without_wandb(sys.argv)  # imports trl, so after the snapshot above
     patch_prepare_kbit()
     from soup_cli.trainer import sft
 

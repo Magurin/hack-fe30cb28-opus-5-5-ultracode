@@ -12,6 +12,7 @@ def apply():
     from . import startup
 
     startup.import_bitsandbytes()  # before peft imports it, see solution/startup.py
+    startup.import_without_sklearn()
     from .patch import patch_soup
 
     try:  # compile our kernels in the background from now on, while Soup sets up
