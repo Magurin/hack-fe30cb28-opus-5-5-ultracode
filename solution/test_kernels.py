@@ -255,13 +255,16 @@ def _tiny_model(tmp_path, dropout):
     return model
 
 
-def test_fused_step_matches_hf(tmp_path):
+@pytest.mark.parametrize("lengths,host", [([17, 60, 33, 5], False), ([17, 60, 33, 5], True),
+                                          ([4], True)])
+def test_fused_step_matches_hf(tmp_path, lengths, host):
+    """Against HF + PEFT; also with the weights and the head streamed from host memory, and for
+    a batch of one short row (4 tokens, one target)."""
     from solution.engine import FusedQwen2
 
     model = _tiny_model(tmp_path, dropout=0.0)
     model.train()
     torch.manual_seed(1)
-    lengths = [17, 60, 33, 5]
     B, T = len(lengths), max(lengths)
     ids = torch.randint(0, 3000, (B, T), device=DEV)
     mask = (torch.arange(T, device=DEV)[None] < torch.tensor(lengths, device=DEV)[:, None])
@@ -281,9 +284,17 @@ def test_fused_step_matches_hf(tmp_path):
     ref_entropy = (torch.logsumexp(logits, -1) - (torch.softmax(logits, -1) * logits).sum(-1))
     ref_entropy = (ref_entropy * mask).sum() / mask.sum()
 
+    if host:
+        from solution.patch import _embedding_to_fp16
+
+        assert _embedding_to_fp16(model.get_base_model())  # as install() does; values exact
     engine = FusedQwen2(model)
+    if host:
+        engine.offload_weights()
+        assert engine.offload_head()
     loss, packed, stats = engine.step(ids, mask, labels, float(n_items))
     grads = torch.autograd.grad(loss, params)
+    engine.restore_weights()
     assert abs(loss.item() - ref_loss.item()) / ref_loss.item() < 2e-3
     entropy = stats.entropy.sum() / packed.n
     assert abs(entropy.item() - ref_entropy.item()) / ref_entropy.item() < 2e-3

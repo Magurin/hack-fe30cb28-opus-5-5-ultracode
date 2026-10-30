@@ -3,7 +3,6 @@ padding) without crashing, also after fused steps moved the 4-bit weights to hos
 (written by the testing stream)."""
 import types
 
-import pytest
 import torch
 
 from solution import patch as P

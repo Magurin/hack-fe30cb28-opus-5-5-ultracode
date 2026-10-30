@@ -83,3 +83,55 @@ def test_restore_for_soups_own_path(tmp_path):
     ids = torch.randint(0, 3000, (2, 16), device=DEV)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         model(input_ids=ids)
+
+
+def _load_to_host(tmp_path, dropout):
+    """The tiny model loaded as Soup's run loads it with the solution applied: the NF4 weights
+    (hostload) and the embedding (offload) go to host memory during the load."""
+    from transformers import modeling_utils
+    from transformers.integrations import bitsandbytes as hf_bnb
+
+    from solution import hostload, offload, warmup
+
+    cls = modeling_utils.PreTrainedModel
+    saved = (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
+             cls.__dict__["_load_pretrained_model"], warmup.fp16_path_gpu)
+    try:
+        warmup.fp16_path_gpu = lambda: True  # the T4 path, also on a bf16 GPU
+        hostload.patch_model_loading()
+        offload.patch_model_loading()
+        return _tiny_model(tmp_path, dropout=dropout)
+    finally:
+        (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
+         loader, warmup.fp16_path_gpu) = saved
+        cls._load_pretrained_model = loader
+
+
+def test_fallback_after_host_load(tmp_path):
+    """Weights and embedding in host memory from the load on: a fused step, Soup's own code for an
+    eval call (everything back on the GPU), a fused step again - the same loss as the first."""
+    from solution import patch as P
+    from solution.test_fallback import _batch, _call, _trainer
+
+    model = _load_to_host(tmp_path, dropout=0.0)
+    assert all(m.weight.device.type == "cpu" for m in _linear4bit(model))
+    assert model.get_input_embeddings().weight.device.type == "cpu"
+    model.to(DEV)  # accelerate, when training starts
+    t = _trainer(model)
+    engine = t._soup_kernels_engine
+    assert engine.weights_on_host()
+    engine.offload_weights()  # what patch.install does when the loader left them on the host
+    model.train()
+    first = _call(t, model, _batch())
+    first.backward()
+    P._flush_metrics(t)
+    model.eval()
+    with torch.no_grad():
+        _call(t, model, _batch())
+    assert all(m.weight.is_cuda for m in _linear4bit(model))
+    assert model.get_input_embeddings().weight.is_cuda
+    model.train()
+    again = _call(t, model, _batch())
+    again.backward()
+    P._flush_metrics(t)
+    assert torch.equal(first.detach(), again.detach())
