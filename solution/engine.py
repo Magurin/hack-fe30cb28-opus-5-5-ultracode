@@ -115,14 +115,8 @@ class WeightStream:
                 self.host[po:po + pn].copy_(w.packed.reshape(-1).view(torch.uint8))
                 self.host[ao:ao + an].copy_(w.absmax.reshape(-1).view(torch.uint8))
         torch.cuda.synchronize(device)
-        self.slot_bytes = max(size for _, size, _ in self.layout)
-        self.slots = [torch.empty((self.slot_bytes,), dtype=torch.uint8, device=device)
-                      for _ in range(self.SLOTS)]
-        self.slot_layer = [None] * self.SLOTS
-        self.copied = [torch.cuda.Event() for _ in range(self.SLOTS)]
-        self.released = [torch.cuda.Event() for _ in range(self.SLOTS)]
-        self.stream = torch.cuda.Stream(device)
-        # Free the device copies: meanwhile the bitsandbytes parameters point at the host bytes.
+        # Free the device copies (the bitsandbytes parameters point at the host bytes meanwhile),
+        # and only then take the three slots, so the peak never holds both.
         self.moved = []
         for _, _, entries in self.layout:
             for w, po, pn, ao, an in entries:
@@ -133,6 +127,13 @@ class WeightStream:
                     state.absmax.shape)
                 w.packed = w.absmax = None
         torch.cuda.empty_cache()
+        self.slot_bytes = max(size for _, size, _ in self.layout)
+        self.slots = [torch.empty((self.slot_bytes,), dtype=torch.uint8, device=device)
+                      for _ in range(self.SLOTS)]
+        self.slot_layer = [None] * self.SLOTS
+        self.copied = [torch.cuda.Event() for _ in range(self.SLOTS)]
+        self.released = [torch.cuda.Event() for _ in range(self.SLOTS)]
+        self.stream = torch.cuda.Stream(device)
 
     def _load(self, i):
         slot = i % self.SLOTS
@@ -162,9 +163,15 @@ class WeightStream:
     def release(self, i):
         self.released[i % self.SLOTS].record(torch.cuda.current_stream(self.device))
 
-    def restore(self):
-        """Put the weights back on the device (after training, for whatever Soup does next)."""
+    def release_slots(self):
         torch.cuda.synchronize(self.device)
+        self.slots = []
+        self.slot_layer = [None] * self.SLOTS
+        torch.cuda.empty_cache()
+
+    def restore(self):
+        """Put the weights back on the device."""
+        self.release_slots()
         for w in self.moved:
             state = w.param.quant_state
             w.param.data = w.param.data.to(self.device)
@@ -172,7 +179,6 @@ class WeightStream:
             w.packed = w.param.data
             w.absmax = state.absmax if w.nested else state.absmax.float()
         self.moved = []
-        self.slots = []
         torch.cuda.synchronize(self.device)
 
 
@@ -303,6 +309,7 @@ class LayerSpec:
 
         projs = {name: getattr(attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")}
         projs.update({name: getattr(mlp, name) for name in ("gate_proj", "up_proj", "down_proj")})
+        self.base_modules = {name: base_of(m) for name, m in projs.items()}
         self.w = {name: NF4Weight(base_of(m).weight) for name, m in projs.items()}
         biases = [base_of(projs[name]).bias for name in ("q_proj", "k_proj", "v_proj")]
         self.bias_qkv = torch.cat([b.detach().to(torch.float16) for b in biases]).contiguous()
@@ -624,6 +631,8 @@ class FusedQwen2:
         lora_names = _lora_targets(inner.layers[0])
         self.layers = [LayerSpec(layer, config, lora_names, i)
                        for i, layer in enumerate(inner.layers)]
+        self.base_modules = [spec.base_modules[name] for spec in self.layers
+                             for name in spec.base_modules]
         self.stream = None
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
         self.norm_w = inner.norm.weight
@@ -639,6 +648,25 @@ class FusedQwen2:
             self.stream = WeightStream(self.layers, self.device)
             for spec in self.layers:
                 spec.stream = self.stream
+
+    def finish_training(self):
+        """Training is over: free the device slots. The weights stay in host memory, which is
+        all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers
+        (if anything runs the model afterwards) brings them back to the GPU first."""
+        if self.stream is None:
+            return
+        for spec in self.layers:
+            spec.stream = None
+        self.stream.release_slots()
+        hooks = []
+
+        def bring_back(module, args):
+            for hook in hooks:
+                hook.remove()
+            self.restore_weights()
+
+        for module in self.base_modules:
+            hooks.append(module.register_forward_pre_hook(bring_back))
 
     def restore_weights(self):
         if self.stream is not None:

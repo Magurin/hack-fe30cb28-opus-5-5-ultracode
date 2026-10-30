@@ -324,3 +324,28 @@ def test_weight_streaming_is_exact(tmp_path):
     for n, p in model.named_parameters():
         if n in before:
             assert p.is_cuda and torch.equal(p.detach(), before[n]), n
+
+
+def test_after_training_save_and_forward(tmp_path):
+    """After finish_training the weights wait in host memory: saving the adapter works as is,
+    and a later forward call brings them back to the GPU and gives the same logits."""
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.0)
+    ids = torch.randint(0, 3000, (2, 16), device=DEV)
+    model.eval()
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        before = model(input_ids=ids).logits.float()
+    model.save_pretrained(tmp_path / "ref")
+    engine = FusedQwen2(model)
+    engine.offload_weights()
+    engine.finish_training()
+    model.save_pretrained(tmp_path / "out")
+    from safetensors.torch import load_file
+
+    ref = load_file(tmp_path / "ref" / "adapter_model.safetensors")
+    out = load_file(tmp_path / "out" / "adapter_model.safetensors")
+    assert ref.keys() == out.keys() and all(torch.equal(ref[k], out[k]) for k in ref)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        after = model(input_ids=ids).logits.float()
+    assert torch.equal(before, after)

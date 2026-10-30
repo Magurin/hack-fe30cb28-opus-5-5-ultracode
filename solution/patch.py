@@ -32,14 +32,14 @@ def _restore_callback_base():
 
 
 class _RestoreWeights(_restore_callback_base()):
-    """Puts the streamed weights back on the GPU when training ends, so saving the adapter and
-    anything Soup does afterwards sees an ordinary model."""
+    """When training ends, frees the weight-streaming slots; the 4-bit weights come back to the
+    GPU on the first forward call anyone makes afterwards (saving the adapter makes none)."""
 
     def __init__(self, engine):
         self.engine = engine
 
     def on_train_end(self, args, state, control, **kwargs):
-        self.engine.restore_weights()
+        self.engine.finish_training()
 
 
 def _log(message):
