@@ -944,6 +944,12 @@ class FusedQwen2:
         per_layer = n * 2 * I * 2
         return max(0, min(L, (cap - self._predicted_peak(n)) // per_layer))
 
+    def nf4_bytes(self):
+        """Bytes of the layers' packed NF4 weights and their absmax."""
+        return sum(w.packed.numel() * w.packed.element_size()
+                   + w.absmax.numel() * w.absmax.element_size()
+                   for spec in self.layers for w in spec.w.values())
+
     def weights_on_host(self):
         """Whether the loader already left the NF4 weights in host memory (solution/hostload)."""
         return any(w.packed.device.type == "cpu" for spec in self.layers for w in spec.w.values())

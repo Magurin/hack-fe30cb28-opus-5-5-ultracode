@@ -34,9 +34,9 @@ KEEP_MARGIN = 112 * 2**20
 # Memory the steps may use above the model-load peak to keep activations instead of recomputing
 # them (0: the run's peak stays the model load).
 EXTRA_MEMORY_MIB = 0
-# With the weights out of the GPU during the load (hostload, and the embedding in host memory),
-# the load no longer sets the run's peak; the steps do. If set, the memory (MiB, allocated) the
-# steps may reach while keeping activations, instead of the load peak minus KEEP_MARGIN.
+# With the weights out of the GPU during the load (hostload), the load no longer sets the run's
+# peak; the steps do. If set, the memory (MiB, allocated) the steps may reach while keeping
+# activations, instead of the (would-be) load peak minus KEEP_MARGIN.
 STEP_CAP_MIB = None
 
 
@@ -359,6 +359,13 @@ def install(trainer, seed=0):
     causal = model.get_base_model()
     fp16_embedding = _embedding_to_fp16(causal)
     engine = FusedQwen2(model, seed=seed)
+    # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
+    # margin for allocator slack) to keep activations instead of recomputing them. NF4 weights
+    # the loader put in host memory count as if they had been loaded to the GPU: the steps keep
+    # the room they had (the run's peak becomes theirs, ~60 MiB under the old load peak on a T4).
+    load_peak = torch.cuda.max_memory_allocated(engine.device)
+    if engine.weights_on_host():
+        load_peak += engine.nf4_bytes()
     if OFFLOAD_WEIGHTS and engine.weights_on_host():
         # the loader left the NF4 weights in host memory (hostload): stream them from now on;
         # peft created the LoRA weights next to them, they train on the GPU
@@ -366,13 +373,10 @@ def install(trainer, seed=0):
         for param in model.parameters():
             if param.requires_grad and param.device != engine.device:
                 param.data = param.data.to(engine.device)
-    # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
-    # margin for allocator slack) to keep activations instead of recomputing them.
     if STEP_CAP_MIB is not None:
         engine.set_memory_cap(STEP_CAP_MIB * 2**20)
     else:
-        engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN
-                              + EXTRA_MEMORY_MIB * 2**20)
+        engine.set_memory_cap(load_peak - KEEP_MARGIN + EXTRA_MEMORY_MIB * 2**20)
     trainer._soup_original_compute_loss = trainer.compute_loss
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
@@ -384,7 +388,8 @@ def install(trainer, seed=0):
          f"{engine.dropout_p}, embedding in fp16: {fp16_embedding}); CUDA memory before "
          f"training: {torch.cuda.memory_allocated() // mib} MiB allocated, "
          f"{torch.cuda.memory_reserved() // mib} MiB reserved, peak reserved so far "
-         f"{torch.cuda.max_memory_reserved() // mib} MiB")
+         f"{torch.cuda.max_memory_reserved() // mib} MiB; steps may keep activations up to "
+         f"{engine.memory_cap // mib} MiB allocated")
     return True
 
 
