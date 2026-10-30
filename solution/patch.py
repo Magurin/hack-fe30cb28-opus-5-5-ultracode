@@ -280,6 +280,14 @@ def install(trainer, seed=0):
     if not _is_supported(model):
         _log("model not recognized, training with the original code path")
         return False
+    from .warmup import fp16_path_gpu
+
+    args = getattr(trainer, "args", None)
+    if not (getattr(args, "fp16", False) and not getattr(args, "bf16", False)
+            and fp16_path_gpu()):
+        _log("not the fp16 training path of a T4-class GPU (bf16 GPU, or older than sm_70): "
+             "training with the original code path")
+        return False
     from .engine import FusedQwen2
 
     causal = model.get_base_model()

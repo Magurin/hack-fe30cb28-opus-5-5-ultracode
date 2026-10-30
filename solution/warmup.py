@@ -119,10 +119,25 @@ def _run(dims, dropout_p):
     del pinned
 
 
+def fp16_path_gpu():
+    """The GPUs the fused step is for: Soup's fp16 path (no bf16, so Soup trains in fp16, as on a
+    T4) on sm_70 or newer (Triton's minimum). On a bf16 GPU Soup trains in bf16, and the fused step,
+    which computes in fp16, would change the computation dtype, so it stays off there."""
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() < (7, 0):
+        return False
+    try:
+        from soup_cli.utils.gpu import cuda_supports_bf16
+        return not cuda_supports_bf16()
+    except Exception:  # noqa: BLE001 - same rule as Soup's own check
+        return torch.cuda.get_device_capability() < (8, 0)
+
+
 def start(base_model):
     """Start compiling for `base_model` (a Hugging Face id or path) in the background."""
     global _thread
-    if _thread is not None or not torch.cuda.is_available():
+    if _thread is not None or not fp16_path_gpu():
         return
     from transformers import AutoConfig
 
