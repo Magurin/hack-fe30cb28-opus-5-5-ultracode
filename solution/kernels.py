@@ -61,12 +61,17 @@ def _nf4_level(n):
     return tl.where((n & 8) != 0, hi, lo)
 
 
-@triton.jit(do_not_specialize=["n_blocks"])
+@triton.jit(do_not_specialize=["n_blocks", "seg1", "seg2"])
 def nf4_dequant_kernel(packed_ptr, absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr,
                        out_ptr, n_blocks, NESTED: tl.constexpr, STANDARD_NF4: tl.constexpr,
-                       BS1: tl.constexpr, BS2: tl.constexpr, ROWS: tl.constexpr):
+                       BS1: tl.constexpr, BS2: tl.constexpr, ROWS: tl.constexpr,
+                       seg1=2147483647, seg2=2147483647):
     """A tile of ROWS quantization blocks of BS1 values (BS1 / 2 bytes each): one absmax per
-    block, both nibbles of every byte from one load, output written as one contiguous tile."""
+    block, both nibbles of every byte from one load, output written as one contiguous tile.
+
+    Up to three weights stored back to back (q, k, v or gate, up) go in one launch: blocks from
+    seg1 on belong to the second, from seg2 on to the third, which only changes the
+    double-quantization offset (offset_ptr[segment]); their absmax2 are concatenated too."""
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     inside = rows < n_blocks
     HALF: tl.constexpr = BS1 // 2
@@ -79,7 +84,8 @@ def nf4_dequant_kernel(packed_ptr, absmax_ptr, code2_ptr, absmax2_ptr, offset_pt
         # multiply-add would differ in the last bit now and then
         scale = libdevice.mul_rn(tl.load(code2_ptr + q),
                                  tl.load(absmax2_ptr + rows // BS2, mask=inside, other=0.0))
-        scale = scale + tl.load(offset_ptr)
+        segment = (rows >= seg1).to(tl.int32) + (rows >= seg2).to(tl.int32)
+        scale = scale + tl.load(offset_ptr + segment)
     else:
         scale = tl.load(absmax_ptr + rows, mask=inside, other=0.0)
     if STANDARD_NF4:

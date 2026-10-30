@@ -66,6 +66,7 @@ class NF4Weight:
         qs = param.quant_state
         self.param = param
         self.packed = param.data  # the device copy the kernel reads (see WeightStream)
+        self.group = None  # an NF4Group, while streamed
         self.shape = tuple(int(s) for s in qs.shape)
         self.numel = self.shape[0] * self.shape[1]
         self.code = qs.code.float().contiguous()
@@ -96,6 +97,54 @@ class NF4Weight:
         return out
 
 
+class NF4Group:
+    """Weights dequantized into one buffer and stored back to back in a WeightStream slot: one
+    kernel launch for all of them. Only the double-quantization offset differs between them (per
+    segment); their absmax2 are concatenated, which needs every weight but the last to end on a
+    whole block of absmax2."""
+
+    @classmethod
+    def of(cls, weights):
+        if not 2 <= len(weights) <= 3:
+            return None
+        w0 = weights[0]
+        for w in weights:
+            if (w.shape[1] != w0.shape[1] or w.bs1 != w0.bs1 or w.bs2 != w0.bs2
+                    or w.nested != w0.nested or w.standard != w0.standard
+                    or not torch.equal(w.code, w0.code)
+                    or (w.nested and not torch.equal(w.code2, w0.code2))):
+                return None
+        if any((w.numel // w.bs1) % w.bs2 for w in weights[:-1]):
+            return None
+        return cls(weights)
+
+    def __init__(self, weights):
+        w0 = weights[0]
+        self.weights = weights
+        self.nested, self.standard, self.bs1, self.bs2 = w0.nested, w0.standard, w0.bs1, w0.bs2
+        self.code, self.code2 = w0.code, w0.code2
+        self.blocks = sum(w.numel for w in weights) // self.bs1
+        bounds = []
+        for w in weights[:-1]:
+            bounds.append((bounds[-1] if bounds else 0) + w.numel // self.bs1)
+        self.seg1, self.seg2 = (bounds + [2147483647, 2147483647])[:2]
+        if self.nested:
+            self.absmax2 = torch.cat([w.absmax2 for w in weights])
+            self.offsets = torch.cat([w.offset for w in weights])
+        self.packed = self.absmax = None  # set while the group's layer sits in a slot
+
+    def dequant_into(self, out):
+        if self.nested:
+            code2, absmax2, offsets = self.code2, self.absmax2, self.offsets
+        else:
+            code2 = absmax2 = offsets = self.absmax
+        _launch(K.nf4_dequant_kernel, (_cdiv(self.blocks, NF4_ROWS),),
+            self.packed, self.absmax, code2, absmax2, offsets, self.code, out, self.blocks,
+            NESTED=self.nested, STANDARD_NF4=self.standard, BS1=self.bs1, BS2=self.bs2,
+            ROWS=NF4_ROWS, seg1=self.seg1, seg2=self.seg2, num_warps=4)
+        return out
+
+
 class WeightStream:
     """The packed NF4 weights of every decoder layer live in pinned host memory during training;
     a layer's bytes are copied into one of three device slots on a side stream, one layer ahead
@@ -105,26 +154,40 @@ class WeightStream:
     runs alongside the GEMMs."""
 
     SLOTS = 3
-    NAMES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+    # weights dequantized together into one buffer (one GEMM each): stored back to back, so one
+    # kernel launch dequantizes the whole group
+    GROUPS = (("q_proj", "k_proj", "v_proj"), ("o_proj",), ("gate_proj", "up_proj"),
+              ("down_proj",))
 
     def __init__(self, specs, device):
         self.specs, self.device = specs, device
-        self.layout = []  # per layer: (start, size, [[weight, packed off, n, absmax off, n]])
+        # per layer: (start, size, [[weight, packed off, n, absmax off, n]],
+        #             [(group, packed off, n, absmax off, n)])
+        self.layout = []
+        self.groups = []
         offset = 0
         for spec in specs:
-            entries, start = [], offset
-            for name in self.NAMES:
-                w = spec.w[name]
-                pk = w.packed.reshape(-1).view(torch.uint8)
-                am = w.absmax.reshape(-1).view(torch.uint8)
-                entry = [w, offset, pk.numel(), 0, am.numel()]
-                offset = _align(offset + pk.numel())
-                entry[3] = offset
-                offset = _align(offset + am.numel())
-                entries.append(entry)
-            self.layout.append((start, offset - start, entries))
+            entries, groups, start = [], [], offset
+            for names in self.GROUPS:
+                ws = [spec.w[name] for name in names]
+                pks = [w.packed.reshape(-1).view(torch.uint8).numel() for w in ws]
+                ams = [w.absmax.reshape(-1).view(torch.uint8).numel() for w in ws]
+                packed_at = offset
+                absmax_at = _align(packed_at + sum(pks))
+                offset = _align(absmax_at + sum(ams))
+                po, ao = packed_at, absmax_at
+                for w, pn, an in zip(ws, pks, ams):
+                    entries.append([w, po, pn, ao, an])
+                    po, ao = po + pn, ao + an
+                group = NF4Group.of(ws)
+                if group is not None:
+                    groups.append((group, packed_at, sum(pks), absmax_at, sum(ams)))
+                    self.groups.append(group)
+                    for w in ws:
+                        w.group = group
+            self.layout.append((start, offset - start, entries, groups))
         self.host = torch.empty((offset,), dtype=torch.uint8, pin_memory=True)
-        for _, _, entries in self.layout:
+        for _, _, entries, _ in self.layout:
             for w, po, pn, ao, an in entries:
                 self.host[po:po + pn].copy_(w.packed.reshape(-1).view(torch.uint8))
                 self.host[ao:ao + an].copy_(w.absmax.reshape(-1).view(torch.uint8))
@@ -132,7 +195,7 @@ class WeightStream:
         # Free the device copies (the bitsandbytes parameters point at the host bytes meanwhile),
         # and only then take the three slots, so the peak never holds both.
         self.moved = []
-        for _, _, entries in self.layout:
+        for _, _, entries, _ in self.layout:
             for w, po, pn, ao, an in entries:
                 data, state = w.param.data, w.param.quant_state
                 self.moved.append(w)
@@ -141,7 +204,7 @@ class WeightStream:
                     state.absmax.shape)
                 w.packed = w.absmax = None
         torch.cuda.empty_cache()
-        self.slot_bytes = max(size for _, size, _ in self.layout)
+        self.slot_bytes = max(layer[1] for layer in self.layout)
         self.slots = [torch.empty((self.slot_bytes,), dtype=torch.uint8, device=device)
                       for _ in range(self.SLOTS)]
         self.slot_layer = [None] * self.SLOTS
@@ -153,7 +216,7 @@ class WeightStream:
         slot = i % self.SLOTS
         if self.slot_layer[slot] == i:
             return
-        start, size, _ = self.layout[i]
+        start, size, _, _ = self.layout[i]
         self.stream.wait_event(self.released[slot])
         with torch.cuda.stream(self.stream):
             self.slots[slot][:size].copy_(self.host[start:start + size], non_blocking=True)
@@ -165,12 +228,16 @@ class WeightStream:
         self._load(i)
         slot = i % self.SLOTS
         torch.cuda.current_stream(self.device).wait_event(self.copied[slot])
-        start, _, entries = self.layout[i]
+        start, _, entries, groups = self.layout[i]
         buf = self.slots[slot]
         for w, po, pn, ao, an in entries:
             w.packed = buf[po - start:po - start + pn]
             absmax = buf[ao - start:ao - start + an]
             w.absmax = absmax if w.nested else absmax.view(torch.float32)
+        for group, po, pn, ao, an in groups:
+            absmax = buf[ao - start:ao - start + an]
+            group.packed = buf[po - start:po - start + pn]
+            group.absmax = absmax if group.nested else absmax.view(torch.float32)
         if 0 <= ahead < len(self.layout):
             self._load(ahead)
 
@@ -179,6 +246,8 @@ class WeightStream:
 
     def release_slots(self):
         torch.cuda.synchronize(self.device)
+        for group in self.groups:
+            group.packed = group.absmax = None
         self.slots = []
         self.slot_layer = [None] * self.SLOTS
         torch.cuda.empty_cache()
@@ -204,6 +273,9 @@ def dequant(weights, device):
     """Dequantize one or more [n_i, K] weights stacked into one fp16 [sum n_i, K] buffer."""
     rows = sum(w.shape[0] for w in weights)
     out = torch.empty((rows, weights[0].shape[1]), device=device, dtype=torch.float16)
+    group = weights[0].group
+    if group is not None and group.packed is not None and group.weights == weights:
+        return group.dequant_into(out)
     start = 0
     for w in weights:
         w.dequant_into(out[start:start + w.shape[0]])
@@ -584,6 +656,11 @@ class _Layer(torch.autograd.Function):
         lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index - 1)
+        # MLP output gradient first: the down_proj weight is freed before the recomputation
+        # dequantizes the other three, so one layer never holds all four at once.
+        w = dequant([spec.w["down_proj"]], dev)
+        dm = dh3.to(torch.float16) @ w
+        del w
         if ctx.kept_all is not None:  # nothing to recompute; the weights are dequantized below
             f, ctx.kept_all = ctx.kept_all, None
         else:
@@ -592,9 +669,6 @@ class _Layer(torch.autograd.Function):
             ctx.kept_gu = None
 
         # MLP
-        w = dequant([spec.w["down_proj"]], dev)
-        dm = dh3.to(torch.float16) @ w
-        del w
         gu = f.pop("gu")
         _glu_bwd(dm, gu, spec.I)
         del dm
@@ -615,9 +689,14 @@ class _Layer(torch.autograd.Function):
         del dout
         dqkv = _rope_bwd(spec, dq, dk, dv, packed)
         del dq, dk, dv
-        w = f.pop("w_qkv") if "w_qkv" in f else dequant(
-            [spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
-        da = dqkv @ w
+        # the first layer's input is the frozen embedding: no gradient through the norm, the qkv
+        # weight or the LoRA A matrices to its input
+        need_dh = ctx.needs_input_grad[0]
+        w = f.pop("w_qkv", None)
+        if need_dh:
+            if w is None:
+                w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+            da = dqkv @ w
         del w
 
         # LoRA: dB = s g^T x, dx = s g B, dA = dx^T drop(a), d drop(a) = dx A
@@ -631,13 +710,13 @@ class _Layer(torch.autograd.Function):
             db_w = (g.t() @ x_lo).float() * s
             dx_lo = (g @ b_w) * s
             da_w = (dx_lo.t() @ a_in).float()
-            grads[short] = (da_w, db_w, dx_lo @ a_w)
+            grads[short] = (da_w, db_w, dx_lo @ a_w if need_dh else None)
             del x_lo, a_in
         del dqkv
         if spec.stream is not None:
             spec.stream.release(spec.index)
         dh = None
-        if ctx.needs_input_grad[0]:
+        if need_dh:
             dh = _rms_bwd(spec, da, h, f["rstd1"], spec.ln1, packed, dres=dh2,
                           tq=grads["q"][2], tv=grads["v"][2], seeds=seeds)
         return (dh, None, None, grads["q"][0], grads["q"][1], None, None, grads["v"][0],
@@ -778,19 +857,23 @@ class FusedQwen2:
     def _predicted_peak(self, n):
         spec = self.layers[0]
         H, I, L = spec.H, spec.I, len(self.layers)
-        weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 3 * I)
-        return torch.cuda.memory_allocated(self.device) + weights + 16 * 2**20 \
-            + n * (L * H * 4 + 100 * 1024)
+        # the dequantized qkv, o and [gate | up] weights a recomputing layer's backward holds
+        # (down_proj is used and freed before the recomputation)
+        weights = 2 * H * ((spec.HQ + 2 * spec.HKV) * spec.D + spec.HQ * spec.D + 2 * I)
+        return (torch.cuda.memory_allocated(self.device) + weights + 48 * 2**20
+                + n * (L * H * 4 + 64 * 1024))
 
     def layers_to_keep(self, n):
         """How many layers can keep their [gate | up] output (2 * I fp16 values per token) instead
         of recomputing that GEMM in backward, without the step's peak reaching the cap.
 
         The peak of a step is at the start of backward: the layer inputs (L x H fp32 per token)
-        plus one layer's backward working set (under 100 KiB per token) plus the dequantized
-        weights of one layer; measured on a run without keeping: 91 MiB + 254 KiB per token above
-        the memory allocated when the step starts. The prediction below is from the model's
-        dimensions and stays above that measurement."""
+        plus one layer's backward working set (about 50 KiB per token) plus the dequantized qkv,
+        o and [gate | up] weights of one layer; measured over a whole run (any keeping
+        subtracted): 65 MiB + 218 KiB per token above the memory allocated when the step starts.
+        The prediction below is from the model's dimensions and stays 46 MiB + 14 KiB per token
+        above that measurement (with 14 MiB a T4 run peaked 16 MiB above the model load in
+        nvidia-smi, with 46 MiB it stays at it)."""
         cap = getattr(self, "memory_cap", None)
         if not cap or not n:
             return 0
