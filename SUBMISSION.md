@@ -1,9 +1,9 @@
 # Submission: TODO название команды
 
 ## Links
-- Repository, final commit: TODO https://github.com/<you>/<repo>/commit/<sha>
+- Repository, final commit: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/b6dd912d78d8c4ec61d6e354662498c8aa68957b
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  the README): TODO https://www.kaggle.com/code/<you>/<notebook>?scriptVersionId=<version>
+  the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
 - Demo video (up to 3 minutes): TODO
 - Presentation: TODO
 
@@ -13,15 +13,15 @@
 | TODO | | | | |
 
 ## Our kernels
-| Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
+| Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4; 15.2% together) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/kernels.py` | bitsandbytes NF4 dequantization (absmax dequant + 4-bit dequant, 2 kernels) | TODO % |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 PyTorch ops), residual add, fp16 casts, LoRA dropout | TODO % |
-| `rms_bwd_kernel` | `solution/kernels.py` | RMSNorm backward, LoRA dropout backward, gradient sums | TODO % |
-| `qkv_rope_fwd_kernel` | `solution/kernels.py` | q/k/v split, fp32 casts, LoRA adds, `apply_rotary_pos_emb` | TODO % |
-| `qkv_rope_bwd_kernel` | `solution/kernels.py` | RoPE backward, `repeat_kv` backward, gradient concat | TODO % |
-| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up and its backward | TODO % |
-| `lm_head_ce_kernel` | `solution/kernels.py` | fp32 logits, cross-entropy, TRL entropy and accuracy, rewind row loss, logits gradient | TODO % |
+| `nf4_dequant_kernel` | `solution/kernels.py` | bitsandbytes NF4 dequantization (absmax dequant + 4-bit dequant, 2 kernels) | 7.2% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 PyTorch ops), residual add, fp16 casts, LoRA dropout | 2.3% |
+| `rms_bwd_kernel` | `solution/kernels.py` | RMSNorm backward, LoRA dropout backward, gradient sums | 1.2% |
+| `qkv_rope_fwd_kernel` | `solution/kernels.py` | q/k/v split, fp32 casts, LoRA adds, `apply_rotary_pos_emb` | 0.6% |
+| `qkv_rope_bwd_kernel` | `solution/kernels.py` | RoPE backward, `repeat_kv` backward, gradient concat | 0.3% |
+| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up and its backward | 1.1 + 1.8% |
+| `lm_head_ce_kernel` | `solution/kernels.py` | fp32 logits, cross-entropy, TRL entropy and accuracy, rewind row loss, logits gradient | 0.7% |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm and fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -33,11 +33,11 @@ ZeRO-Offload / ZeRO-Infinity weight offloading (https://arxiv.org/abs/2101.06840
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | TODO | TODO | TODO speedup x |
-| Peak GPU memory, MiB | TODO | TODO | TODO base/ours x |
-| Eval loss (public rows) | TODO | TODO | TODO % vs base |
+| Time of `soup train`, s | 90.2 | 55.8 | 1.618x speedup (1.42x in our `--repeats 2` run) |
+| Peak GPU memory, MiB | 14,345 | 1,275 | 11.25x base/ours |
+| Eval loss (public rows) | 2.04966 | 2.04955 | -0.005% vs base |
 
-- [ ] All 10 checks of `harness/check_rules.py` passed (if not: which failed and why)
+- [x] All 10 checks of `harness/check_rules.py` passed (if not: which failed and why)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 ## Presentation covers
