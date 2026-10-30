@@ -349,3 +349,30 @@ def test_after_training_save_and_forward(tmp_path):
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         after = model(input_ids=ids).logits.float()
     assert torch.equal(before, after)
+
+
+def test_keeping_gate_up_is_exact(tmp_path):
+    """Layers that keep their [gate | up] output for backward give bit-identical results to
+    layers that recompute it."""
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    torch.manual_seed(3)
+    ids = torch.randint(0, 3000, (2, 30), device=DEV)
+    mask = torch.ones_like(ids)
+    labels = ids.clone()
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(cap):
+        engine = FusedQwen2(model, seed=5)
+        if cap:
+            engine.set_memory_cap(cap)
+        assert engine.layers_to_keep(60) == (len(engine.layers) if cap else 0)
+        loss, _, _ = engine.step(ids, mask, labels, 58.0)
+        return loss, torch.autograd.grad(loss, params)
+
+    loss_a, grads_a = run(None)
+    loss_b, grads_b = run(1 << 40)
+    assert torch.equal(loss_a, loss_b)
+    assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))

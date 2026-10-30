@@ -23,6 +23,7 @@ import torch
 
 _INSTALLED_ATTR = "_soup_kernels_engine"
 OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (engine.WeightStream)
+KEEP_MARGIN = 64 * 2**20  # bytes kept free under the load peak when deciding what to keep
 
 
 def _restore_callback_base():
@@ -242,6 +243,9 @@ def install(trainer, seed=0):
     causal = model.get_base_model()
     fp16_embedding = _embedding_to_fp16(causal)
     engine = FusedQwen2(model, seed=seed)
+    # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
+    # margin for allocator slack) to keep activations instead of recomputing them.
+    engine.set_memory_cap(torch.cuda.max_memory_allocated(engine.device) - KEEP_MARGIN)
     trainer._soup_original_compute_loss = trainer.compute_loss
     setattr(trainer, _INSTALLED_ATTR, engine)
     trainer.compute_loss = types.MethodType(fused_compute_loss, trainer)
@@ -261,7 +265,7 @@ def patch_library_overheads():
     - `importlib.metadata.packages_distributions()` walks every installed distribution (2.3 s
       on the Kaggle image, and nothing caches it). transformers calls it at import and keeps the
       result in `PACKAGE_DISTRIBUTION_MAPPING`; trl's import calls it again. Later callers get a
-      copy of that same mapping;
+      fresh copy of a snapshot of that same mapping;
     - `datasets.Dataset.map` on an in-memory dataset hashes the transform with dill to name a
       cache file it never writes (no `cache_files`); the transforms here close over the
       tokenizer, so that is the whole 151,936-token vocabulary pickled per call. For such a
@@ -278,8 +282,11 @@ def patch_library_overheads():
                 mapping = None
                 module = sys.modules.get("transformers.utils.import_utils")
                 mapping = getattr(module, "PACKAGE_DISTRIBUTION_MAPPING", None)
-                computed.append(mapping if isinstance(mapping, dict)
-                                else original_packages_distributions())
+                if not isinstance(mapping, dict):
+                    mapping = original_packages_distributions()
+                # a snapshot, so a caller that mutates transformers' dict (or its own copy)
+                # cannot change what the others get
+                computed.append({name: list(dists) for name, dists in mapping.items()})
             return {name: list(dists) for name, dists in computed[0].items()}
 
         original_packages_distributions = metadata.packages_distributions
