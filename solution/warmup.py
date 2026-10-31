@@ -22,6 +22,9 @@ import torch
 # One compile thread: on Kaggle's 2 cores x 2 threads, every further one slows Soup's model load
 # more than it shortens the compilation (3 threads: 0.8-1.3 s more outside the training loop).
 COMPILE_THREADS = 1
+# The LoRA dropout of Soup's default config (the task's), which the dropout variants of our
+# kernels are compiled for
+LORA_DROPOUT = 0.05
 _thread = None
 _pages = None  # the thread faulting in engine.GuStream's host buffer
 _timing = {}
@@ -116,9 +119,10 @@ def _run(dims, dropout_p):
               empty(1, dtype=torch.int32))
 
     def ce_pieces():  # the lm_head streamed from host memory (engine.HostHead)
-        E._ce_piece(empty(1, 8192, dtype=f16), empty(8192, H, dtype=f16),
+        piece = E.HostHead.PIECE
+        E._ce_piece(empty(1, piece, dtype=f16), empty(piece, H, dtype=f16),
                     empty(1, dtype=torch.long), empty(1, 4), empty(1, dtype=torch.int32),
-                    empty(1), empty(1), empty(1, H, dtype=f16), 8192, 5)
+                    empty(1), empty(1), empty(1, H, dtype=f16), piece, 5)
         E._ce_finish(empty(1, 4), empty(1, dtype=torch.int32), empty(1),
                      empty(1, dtype=torch.long), empty(1), empty(1), empty(1, dtype=torch.int32),
                      empty(1, H), empty(1, H, dtype=f16), empty(1, H, dtype=f16), 5)
@@ -143,7 +147,7 @@ def _run(dims, dropout_p):
             E._COMPILE_ONLY.kernels = None
 
     # Pin the host memory the NF4 weights will be streamed from (WeightStream) first, before the
-    # compilation: pinning ~650 MB costs ~0.15 s, and PyTorch's caching host allocator hands the
+    # compilation: pinning ~650 MiB costs ~0.15 s, and PyTorch's caching host allocator hands the
     # freed block (rounded up to a power of two) to the same-sized request at the first training
     # step. Done after the compilation, it kept the start of training waiting longer (Brev A/B:
     # 0.55 s instead of 0.10 s).
@@ -156,8 +160,8 @@ def _run(dims, dropout_p):
                          pin_memory=True)
     del pinned
 
-    # One task per @triton.jit function (its variants one after the other), so with several
-    # threads no two compile into the same kernel's cache.
+    # One task per @triton.jit function (its variants one after the other): with
+    # COMPILE_THREADS > 1, no two threads compile into the same kernel's cache.
     jobs = [rms_forward, rms_backward, glu, ce, ce_pieces, nf4,
             lambda: E._rope_fwd(spec, qkv, empty(1, HQ * D, dtype=f16),
                                 empty(1, HKV * D, dtype=f16), packed, 2.0),
@@ -204,7 +208,7 @@ def start(base_model):
         _lower_priority()
         started = time.perf_counter()
         try:
-            _run(dims, 0.05)
+            _run(dims, LORA_DROPOUT)
         except Exception as exc:  # noqa: BLE001 - a missed warm-up only costs time
             print(f"[solution] kernel warm-up skipped ({exc.__class__.__name__}: {exc})",
                   file=sys.stderr, flush=True)
