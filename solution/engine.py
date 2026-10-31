@@ -1015,7 +1015,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         d = m @ w.t()
         del w, m
         return _layer_output(spec, packed, h2, d), None
-    if gu is None and not (keep and chunks):
+    if gu is None and not (keep and chunks):  # (chunks in host memory: the backward loads them)
         gus = packed.gus if not keep and packed.gus is not None \
             and packed.gus.holds(spec.index) else None
         if gus is None:
