@@ -15,7 +15,6 @@
 **Kaggle T4 · Soup 0.77.0 · Qwen2.5-1.5B-Instruct в NF4 · LoRA r=16 на q/v · batch 4 · 64 шага · fp16**
 
 [замер на Kaggle (версия 24)](https://www.kaggle.com/code/magurin/soup-kernel-run) ·
-[Kaggle-ноутбук сдачи](https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode) ·
 [финальный код `bfff00c`](https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c) ·
 [презентация](presentation/slides.pdf) ·
 [SUBMISSION](SUBMISSION.md)
@@ -56,8 +55,7 @@
 шина PCIe там другие (копия host -> GPU ~6,3 ГБ/с против 10-12 на Kaggle), поэтому время с Kaggle не сравниваем, а
 память и проверки переносятся.
 
-- Kaggle-ноутбук (шаблонный `templates/kaggle_notebook.ipynb`, сохранённая версия с выводом):
-  https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
+- Kaggle-ноутбук официального замера (версия 24, с выводом): https://www.kaggle.com/code/magurin/soup-kernel-run
 - Репозиторий: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode, код замера -
   `bfff00c` (`solution_sha256` `9efa8ec1`, версия 24 публичного ноутбука замера [`magurin/soup-kernel-run`](https://www.kaggle.com/code/magurin/soup-kernel-run)); это и есть
   финальный код, в `main` код тот же. Поздний прогрев с загрузкой NF4 сразу в pinned-буфер проверен

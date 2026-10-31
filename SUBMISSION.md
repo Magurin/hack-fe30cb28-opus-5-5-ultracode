@@ -14,10 +14,6 @@ backward тоже ждут на хосте (последние - вместо п
   into pinned memory (-0.3..-0.85 s out of the loop in Kaggle A/Bs) was tested after the measurement
   and is not in the final code (no official measurement in time)
 - Public Kaggle notebook of the official measurement (version 24, `bfff00c`: 1.815x / 30.98x, all 10 checks): https://www.kaggle.com/code/magurin/soup-kernel-run
-- Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
-  (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
-  Save & Run All; ноутбук и репозиторий открыты для жюри)
 - Demo video (up to 3 minutes): TODO (заполняет команда)
 - Presentation (PDF, 10 slides): https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/blob/main/presentation/slides.pdf
 
