@@ -403,45 +403,9 @@ def test_cuda_stack_limit_leaves_the_kernels_alone():
     assert all(torch.equal(x, y) for x, y in zip(before, after))
 
 
-@pytest.mark.parametrize("layers", [2, 7])
-def test_lean_gate_up_in_host_memory_is_exact(tmp_path, layers):
-    """A lean step's [gate | up] chunks kept in pinned host memory (GuStream.begin_lean: a ring
-    of chunk buffers, the backward fetching one ahead across chunks and layers) instead of
-    recomputed give bit-identical loss and LoRA gradients, over two steps."""
-    from solution.engine import FusedQwen2
-    from solution.patch import _embedding_to_fp16
-
-    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
-    model.train()
-    assert _embedding_to_fp16(model.get_base_model())
-    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
-    params = [p for p in model.parameters() if p.requires_grad]
-
-    def run(gu_on_host):
-        engine = FusedQwen2(model, seed=11)
-        engine.offload_weights()
-        engine.offload_head()
-        engine.offload_inputs()
-        if gu_on_host:
-            engine.offload_gus()
-        engine.mlp_chunk = 16
-        engine.set_memory_cap(1)  # nothing fits: no keeping, lean
-        out = []
-        for ids, mask, labels in batches:
-            loss, packed, _ = engine.step(ids, mask, labels, 80.0)
-            assert packed.lean and (packed.gus is not None) == gu_on_host
-            out.append((loss, torch.autograd.grad(loss, params)))
-        engine.restore_weights()
-        return out
-
-    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
-        assert torch.equal(loss_a, loss_b)
-        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
-
-
 def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
     """A step too long for the ring of whole [gate | up] outputs but not lean: those layers run
-    their MLP in chunks with the chunks in host memory (GuStream.begin_lean). Bit-identical to
+    their MLP in chunks with the chunks in host memory (GuStream.begin_chunks). Bit-identical to
     the lean step recomputing its chunks (the same chunked MLP; the lean step's other
     difference, the attention recomputed in its own part, gives the same values)."""
     from solution.engine import FusedQwen2
@@ -455,10 +419,10 @@ def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
     monkeypatch.setattr(FusedQwen2, "layers_to_keep", lambda self, n: 0)
 
     def run(gu_on_host):
-        # with the GuStream: a ring of whole outputs would make the step lean, without it the
-        # step is plain; without the GuStream: lean
+        # with the GuStream: a ring of whole outputs would make the step lean, a ring of chunks
+        # not; without the GuStream: lean
         monkeypatch.setattr(FusedQwen2, "lean",
-                            (lambda self, n, extra=0: extra > 0) if gu_on_host
+                            (lambda self, n, extra=0: extra > 2 * 32 * 2 * 640 * 2) if gu_on_host
                             else (lambda self, n, extra=0: True))
         engine = FusedQwen2(model, seed=11)
         engine.offload_weights()

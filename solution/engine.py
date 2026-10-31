@@ -434,7 +434,7 @@ class GuStream(_HostRing):
     def __init__(self, layers, device):
         super().__init__(layers, device)
         self.registered = None  # `host`, if pinned in place (unregistered before it is freed)
-        self.chunk = None  # tokens per [gate | up] chunk in a lean step (begin_lean)
+        self.chunk = None  # tokens per [gate | up] chunk (begin_chunks)
 
     def unregister(self):
         if self.registered is not None:
@@ -444,6 +444,9 @@ class GuStream(_HostRing):
 
     def ring_bytes(self, n, cols):
         return self.SLOTS * n * cols * 2
+
+    def chunk_ring_bytes(self, chunk, cols):
+        return self.SLOTS * chunk * cols * 2
 
     def release(self):
         """Free the ring: the compute stream has waited for every copy into or out of it."""
@@ -467,10 +470,10 @@ class GuStream(_HostRing):
         self.in_slot = [None] * self.SLOTS
         self.chunk = None
 
-    def begin_lean(self, n, cols, chunk):
-        """A step too long for the ring of whole outputs: the [gate | up] of the layers below
-        `upto` (every layer in a lean step), in chunks of `chunk` tokens (their MLP runs in
-        chunks), goes to host memory through a ring of SLOTS chunk buffers; the backward fetches
+    def begin_chunks(self, n, cols, chunk):
+        """A step too long for the ring of whole outputs (but not lean): the [gate | up] of the
+        layers below `upto`, in chunks of `chunk` tokens (their MLP runs in chunks, as a lean
+        step's), goes to host memory through a ring of SLOTS chunk buffers; the backward fetches
         the chunks back one ahead, in its order (the layers from the last, a layer's chunks
         from the first)."""
         self._host(n, cols)
@@ -482,7 +485,7 @@ class GuStream(_HostRing):
         self.loaded = {}  # (layer, first token) -> (slot, event of its copy in)
 
     def chunk_slot(self, rows):
-        """Lean forward: the slot the next chunk's [gate | up] GEMM writes into."""
+        """Forward: the slot the next chunk's [gate | up] GEMM writes into."""
         s = self.k % self.SLOTS
         self.k += 1
         if self.copied[s] is not None:
@@ -490,7 +493,7 @@ class GuStream(_HostRing):
         return s, self.ring[s, :rows]
 
     def chunk_save(self, s, i, c0, c1):
-        """Lean forward: copy chunk c0:c1 of layer i (in slot s) out."""
+        """Forward: copy chunk c0:c1 of layer i (in slot s) out."""
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(self.device))
         self.out_stream.wait_event(ready)
@@ -514,7 +517,7 @@ class GuStream(_HostRing):
         self.loaded[key] = (s, done)
 
     def chunk_load(self, i, c0, c1):
-        """Lean backward: chunk c0:c1 of layer i's [gate | up] on the current stream; starts
+        """Backward: chunk c0:c1 of layer i's [gate | up] on the current stream; starts
         fetching the next one."""
         key = (i, c0)
         if key not in self.loaded:
@@ -901,8 +904,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     if part == "mlp_input":
         return None, {"h2": h2, "rstd2": rstd2, "b": b}
     w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
-    chunks = packed.gus is not None and packed.gus.chunk \
-        and (packed.lean or packed.gus.holds(spec.index))
+    chunks = packed.gus is not None and packed.gus.chunk and packed.gus.holds(spec.index)
     if (packed.lean or chunks) and not keep and gu is None and not full and not return_gu:
         # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time (to host
         # memory, if the GuStream takes this layer's in chunks)
@@ -1010,10 +1012,9 @@ class _Layer(torch.autograd.Function):
             b = f.pop("b")
             w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
             db = torch.empty((n, H), device=dev, dtype=torch.float16)
-            gus = packed.gus if packed.gus is not None and packed.gus.chunk else None
             for c0 in range(0, n, packed.mlp_chunk):
                 c1 = min(n, c0 + packed.mlp_chunk)
-                gu = b[c0:c1] @ w.t() if gus is None else gus.chunk_load(spec.index, c0, c1)
+                gu = b[c0:c1] @ w.t()
                 _glu_bwd(dm[c0:c1], gu, spec.I)
                 torch.mm(gu, w, out=db[c0:c1])
                 del gu
@@ -1039,7 +1040,7 @@ class _Layer(torch.autograd.Function):
             gu = f.pop("gu", None)
             w = f.pop("w_gu") if "w_gu" in f else dequant(
                 [spec.w["gate_proj"], spec.w["up_proj"]], dev)
-            if gu is None:  # in host memory in chunks (GuStream.begin_lean)
+            if gu is None:  # in host memory in chunks (GuStream.begin_chunks)
                 db = torch.empty((n, H), device=dev, dtype=torch.float16)
                 for c0 in range(0, n, packed.mlp_chunk):
                     c1 = min(n, c0 + packed.mlp_chunk)
@@ -1543,13 +1544,17 @@ class FusedQwen2:
             if self.layers_to_keep(packed.n) < L:
                 # some layer would recompute its [gate | up]: a ring of whole [gate | up]
                 # outputs if the step with it still needs no lean recomputation, else a ring of
-                # MLP_CHUNK-token chunks (the MLP of those layers runs in chunks); allocated
-                # before the plan, which counts it
+                # MLP_CHUNK-token chunks (the MLP of those layers runs in chunks) if the step
+                # with that one does not either; allocated before the plan, which counts it. A
+                # lean step recomputes: its [gate | up] copies (every layer, 2 GB each way for
+                # 2048 tokens) made a T4 instance's 4 x 512-token run 10 s slower.
+                chunks = self.gus.chunk_ring_bytes(self.mlp_chunk, cols)
                 if not self.lean(packed.n, self.gus.ring_bytes(packed.n, cols)):
                     self.gus.begin(packed.n, cols)
-                else:
-                    self.gus.begin_lean(packed.n, cols, self.mlp_chunk)
-                packed.gus = self.gus
+                    packed.gus = self.gus
+                elif not self.lean(packed.n, chunks):
+                    self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
+                    packed.gus = self.gus
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = L - k_gu
         packed.keep_all_from = L - k_all
