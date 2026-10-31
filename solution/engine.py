@@ -468,10 +468,11 @@ class GuStream(_HostRing):
         self.chunk = None
 
     def begin_lean(self, n, cols, chunk):
-        """A lean step (FusedQwen2.lean): every layer's [gate | up], in its chunks of `chunk`
-        tokens (the MLP's), goes to host memory through a ring of SLOTS chunk buffers instead
-        of the layer's whole output; the backward fetches the chunks back one ahead, in its
-        order (the layers from the last, a layer's chunks from the first)."""
+        """A step too long for the ring of whole outputs: the [gate | up] of the layers below
+        `upto` (every layer in a lean step), in chunks of `chunk` tokens (their MLP runs in
+        chunks), goes to host memory through a ring of SLOTS chunk buffers; the backward fetches
+        the chunks back one ahead, in its order (the layers from the last, a layer's chunks
+        from the first)."""
         self._host(n, cols)
         self.ring = torch.empty((self.SLOTS, chunk, cols), device=self.device,
                                 dtype=torch.float16)
@@ -900,11 +901,14 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     if part == "mlp_input":
         return None, {"h2": h2, "rstd2": rstd2, "b": b}
     w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
-    if packed.lean and not keep and gu is None and not full and not return_gu:
-        # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time
+    chunks = packed.gus is not None and packed.gus.chunk \
+        and (packed.lean or packed.gus.holds(spec.index))
+    if (packed.lean or chunks) and not keep and gu is None and not full and not return_gu:
+        # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time (to host
+        # memory, if the GuStream takes this layer's in chunks)
         del aq, av, q, k, v, k_e, v_e, out, lse
         m = torch.empty((n, spec.I), device=dev, dtype=torch.float16)
-        gus = packed.gus if packed.gus is not None and packed.gus.chunk else None
+        gus = packed.gus if chunks else None
         for c0 in range(0, n, packed.mlp_chunk):
             c1 = min(n, c0 + packed.mlp_chunk)
             if gus is None:
@@ -918,7 +922,7 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         d = m @ w.t()
         del w, m
         return _layer_output(spec, packed, h2, d), None
-    if gu is None:
+    if gu is None and not (keep and chunks):
         gus = packed.gus if not keep and packed.gus is not None \
             and packed.gus.holds(spec.index) else None
         if gus is None:
@@ -1024,20 +1028,28 @@ class _Layer(torch.autograd.Function):
                 f, ctx.kept_all = ctx.kept_all, None
             else:
                 gu = ctx.kept_gu
-                if gu is None and packed.gus is not None and packed.gus.holds(spec.index):
+                if gu is None and packed.gus is not None and packed.gus.holds(spec.index) \
+                        and not packed.gus.chunk:
                     gu = packed.gus.load(spec.index)
                 with torch.no_grad():
                     _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=gu)
                 ctx.kept_gu = gu = None
 
             # MLP
-            gu = f.pop("gu")
-            _glu_bwd(dm, gu, spec.I)
-            del dm
+            gu = f.pop("gu", None)
             w = f.pop("w_gu") if "w_gu" in f else dequant(
                 [spec.w["gate_proj"], spec.w["up_proj"]], dev)
-            db = gu @ w
-            del w
+            if gu is None:  # in host memory in chunks (GuStream.begin_lean)
+                db = torch.empty((n, H), device=dev, dtype=torch.float16)
+                for c0 in range(0, n, packed.mlp_chunk):
+                    c1 = min(n, c0 + packed.mlp_chunk)
+                    gu = packed.gus.chunk_load(spec.index, c0, c1)
+                    _glu_bwd(dm[c0:c1], gu, spec.I)
+                    torch.mm(gu, w, out=db[c0:c1])
+            else:
+                _glu_bwd(dm, gu, spec.I)
+                db = gu @ w
+            del w, dm
             del gu
             dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
             del db, dh3
@@ -1528,24 +1540,23 @@ class FusedQwen2:
         cols = 2 * self.layers[0].I
         if self.gus is not None:
             self.gus.release()
-            if self.layers_to_keep(packed.n) < L \
-                    and not self.lean(packed.n, self.gus.ring_bytes(packed.n, cols)):
-                # some layer would recompute its [gate | up], and with the ring (allocated
-                # before the plan) the step still needs no lean recomputation (it keeps nothing)
-                self.gus.begin(packed.n, cols)
+            if self.layers_to_keep(packed.n) < L:
+                # some layer would recompute its [gate | up]: a ring of whole [gate | up]
+                # outputs if the step with it still needs no lean recomputation, else a ring of
+                # MLP_CHUNK-token chunks (the MLP of those layers runs in chunks); allocated
+                # before the plan, which counts it
+                if not self.lean(packed.n, self.gus.ring_bytes(packed.n, cols)):
+                    self.gus.begin(packed.n, cols)
+                else:
+                    self.gus.begin_lean(packed.n, cols, self.mlp_chunk)
                 packed.gus = self.gus
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = L - k_gu
         packed.keep_all_from = L - k_all
         packed.mlp_chunk = self.mlp_chunk
         packed.lean = k_gu == 0 and self.lean(packed.n)
-        if packed.lean and self.gus is not None:
-            # (the lean step's [gate | up] chunks to host memory, ring of chunks)
-            self.gus.release()
-            self.gus.begin_lean(packed.n, cols, packed.mlp_chunk)
-            packed.gus = self.gus
-        elif packed.gus is not None:
-            packed.gus.upto = packed.keep_gu_from
+        if packed.gus is not None:
+            packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)
