@@ -76,6 +76,11 @@ def _unoptimized_c_builds():
 
 
 def _run(dims, dropout_p):
+    from . import startup
+
+    # on this thread, before the first compile: importing Triton on the main thread in apply()
+    # cost ~0.5 s of a Kaggle CPU there
+    startup.cheaper_triton_key()
     from . import engine as E
     from . import kernels as K
 
