@@ -116,3 +116,61 @@ def import_without_wandb(argv):
                               ("transformers.integrations", "is_wandb_available"),
                               ("accelerate.utils", "is_wandb_available")],
                     ["trl.extras.profiling", "trl.trainer.callbacks", "trl.trainer.base_trainer"])
+
+
+# At the end of a run, once every exit handler has run (the files they write are written), the
+# process leaves without the interpreter's own teardown (module and object finalization, the
+# CUDA context and the pinned host memory torn down object by object, ~2 s): os._exit with the
+# exit code the program asked for (organizers' answers t.me/souptasterschat/5199, 5190 p.2,
+# 5202). Only on a normal end through sys.exit with an int (or None) code and no uncaught
+# exception; anything else exits as usual.
+FAST_EXIT = True
+
+
+def exit_without_teardown():
+    import atexit
+    import threading
+
+    if not FAST_EXIT or getattr(sys.exit, "_soup_kernels_patched", False):
+        return
+    state = {"code": None, "error": False}
+    original_exit, original_hook = sys.exit, sys.excepthook
+    original_thread_hook = threading.excepthook
+
+    def exit(code=None):
+        state["code"] = 0 if code is None else code
+        original_exit(code)
+
+    def excepthook(*args):
+        state["error"] = True
+        original_hook(*args)
+
+    def thread_excepthook(args):
+        state["error"] = True
+        original_thread_hook(args)
+
+    def finish():
+        code = state["code"]
+        if state["error"] or not isinstance(code, int) or isinstance(code, bool):
+            return
+        atexit.unregister(finish)
+        atexit._run_exitfuncs()  # every other exit handler, as the interpreter would run them
+        try:
+            import torch
+
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                torch.cuda.synchronize()  # nothing still runs on the GPU
+        except Exception:  # noqa: BLE001 - then the usual teardown, which reports it
+            return
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(code)
+
+    exit._soup_kernels_patched = True
+    sys.exit = exit
+    sys.excepthook = excepthook
+    threading.excepthook = thread_excepthook
+    atexit.register(finish)

@@ -14,6 +14,7 @@ def apply():
     from . import startup
 
     startup.small_cublas_workspace()  # before the first cuBLAS call of the process
+    startup.exit_without_teardown()  # at the end: every exit handler, then os._exit (startup.py)
     startup.import_bitsandbytes()  # before peft imports it, see solution/startup.py
     startup.import_without_sklearn()
     try:  # compile our kernels in the background from now on, while Soup imports and sets up
