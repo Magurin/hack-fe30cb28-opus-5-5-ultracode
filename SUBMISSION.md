@@ -43,7 +43,9 @@ ZeRO-Offload / ZeRO-Infinity weight offloading (https://arxiv.org/abs/2101.06840
 varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное в PyTorch ядро с `cu_seqlens`).
 
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
-`run_task.py --repeats 2` (база, решение, решение, база в одной сессии), публичные строки, seed 1.
+`run_task.py --repeats 2` (база, решение, решение, база в одной сессии), публичные строки, seed 1:
+цифры таблицы - из `runs_r2/result.json` и `runs_r2/checks.json` дополнительной ячейки (README,
+"Как запустить", шаг 5); шаблонный прогон с одним запуском - `runs/result.json` и `runs/checks.json`.
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
