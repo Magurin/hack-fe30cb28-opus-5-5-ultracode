@@ -1102,8 +1102,21 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     del o
     if part == "mlp_input":
         return None, {"h2": h2, "rstd2": rstd2, "b": b}
-    w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
     chunks = packed.gus is not None and packed.gus.chunk and packed.gus.holds(spec.index)
+    if return_gu and gu is None and not keep and not full and not packed.lean:
+        # a layer keeping its [gate | up] on the GPU: the step peaks in these layers' forward,
+        # so their GEMM goes in two halves, gate then up, each weight dequantized right before
+        # its half (half the 52.5 MiB [gate | up] weight alive); cuBLAS writes each half into
+        # its columns of the output in place, bit for bit what the one GEMM gives (T4, 37-2048
+        # tokens)
+        gu = torch.empty((n, 2 * spec.I), device=dev, dtype=torch.float16)
+        for name, cols in (("gate_proj", slice(0, spec.I)), ("up_proj", slice(spec.I, None))):
+            w = dequant([spec.w[name]], dev)
+            torch.mm(b, w.t(), out=gu[:, cols])
+            del w
+        w = None
+    else:
+        w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
     if (packed.lean or chunks) and not keep and gu is None and not full and not return_gu:
         # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time (to host
         # memory, if the GuStream takes this layer's in chunks)
