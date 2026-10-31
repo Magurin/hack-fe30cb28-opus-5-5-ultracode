@@ -234,6 +234,12 @@ def _fault_in_gu_pages(dims):
 
     E.GuStream.pages = torch.zeros((dims["L"], E.GuStream.HOST_ROWS, 2 * dims["I"]),
                                    dtype=torch.float16)
+    from . import patch
+
+    if patch.OFFLOAD_ATTN:  # and engine.AttnStream's (560 MiB)
+        cols = 2 * dims["HQ"] * dims["D"] + 2 * dims["HKV"] * dims["D"] + dims["H"]
+        E.AttnStream.pages = torch.zeros((dims["L"], E.AttnStream.HOST_ROWS, cols),
+                                         dtype=torch.float16)
 
 
 def start_from_command_line(argv):
@@ -255,7 +261,7 @@ def discard_pages():
         _pages.join()
         from . import engine as E
 
-        E.GuStream.pages = None
+        E.GuStream.pages = E.AttnStream.pages = None
 
 
 def wait(timeout=300):

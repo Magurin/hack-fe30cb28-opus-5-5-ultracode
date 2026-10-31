@@ -482,9 +482,11 @@ def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
         engine.offload_inputs()
         if gu_on_host:
             engine.offload_gus()
+        engine.offload_attns()  # never taken here: no ring of whole [gate | up] outputs
         engine.mlp_chunk = 32
         loss, packed, _ = engine.step(ids, mask, labels, 80.0)
         assert packed.lean != gu_on_host
+        assert packed.attns is None
         assert not gu_on_host or (packed.gus.chunk == 32 and packed.gus.upto == 7)
         grads = torch.autograd.grad(loss, params)
         engine.restore_weights()
