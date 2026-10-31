@@ -4,7 +4,8 @@ None of them uses tl.dot, so nothing here depends on tensor-core support in Trit
 the matrix multiplies stay in cuBLAS, the kernels below do everything around them.
 
   nf4_dequant_kernel   NF4 weights with double-quantized absmax -> fp16, one pass
-  rms_fwd_kernel       [residual add] + RMSNorm -> fp16, plus the two LoRA-dropout inputs
+  rms_fwd_kernel       [residual add] + RMSNorm -> fp16, plus the two LoRA-dropout inputs (the
+                       base's own masks: PyTorch's dropout Philox stream, _torch_dropout_keep)
   rms_bwd_kernel       RMSNorm backward, merging the LoRA-dropout gradients, + residual grad
   qkv_rope_fwd_kernel  bias'ed qkv + LoRA deltas -> RoPE(q), RoPE(k), v in the attention layout,
                        k and v already repeated for GQA
