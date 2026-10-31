@@ -1,4 +1,5 @@
-"""Figures of the README (docs/img/*.svg, a light and a dark variant of each).
+"""Figures of the README (docs/img/*.svg, a light and a dark variant of each, each on its own
+background so it stays readable whichever GitHub theme shows it).
 
 Numbers: the official Kaggle T4 measurement of bfff00c (version 24 of magurin/soup-kernel-run,
 --repeats 2) and the memory waterfall of the README (nvidia-smi peaks on a T4).
@@ -13,9 +14,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 OUT = Path(__file__).parent / "img"
 THEMES = {
-    "light": dict(text="#1f2328", muted="#59636e", grid="#d1d9e0", base="#8c959f", base2="#d1d9e0",
+    "light": dict(bg="#ffffff", text="#1f2328", muted="#59636e", grid="#d1d9e0", base="#8c959f", base2="#d1d9e0",
                   ours="#1a7f37", ours2="#7ee2a8"),
-    "dark": dict(text="#e6edf3", muted="#9198a1", grid="#3d444d", base="#6e7681", base2="#3d444d",
+    "dark": dict(bg="#0d1117", text="#e6edf3", muted="#9198a1", grid="#3d444d", base="#6e7681", base2="#3d444d",
                  ours="#3fb950", ours2="#1f6f3a"),
 }
 plt.rcParams.update({"font.family": "DejaVu Sans", "svg.fonttype": "path", "font.size": 11})
@@ -47,7 +48,7 @@ def num(x, digits=1):
 
 
 def style(ax, t):
-    ax.set_facecolor("none")
+    ax.set_facecolor(t["bg"])
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(t["grid"])
@@ -58,7 +59,7 @@ def style(ax, t):
 
 def hero(name, t):
     fig, (a, b) = plt.subplots(1, 2, figsize=(11, 3.3), gridspec_kw={"width_ratios": [1.25, 1]})
-    fig.patch.set_alpha(0)
+    fig.patch.set_facecolor(t["bg"])
     rows = ["Решение", "База"]
     loops, walls = [OURS_LOOP, BASE_LOOP], [OURS_WALL, BASE_WALL]
     a.barh(rows, loops, color=[t["ours"], t["base"]], height=0.56, label="цикл обучения, 64 шага")
@@ -90,7 +91,7 @@ def hero(name, t):
              "среднее двух запусков; eval loss +0,003%, все 10 проверок check_rules.py",
              color=t["muted"], fontsize=9)
     fig.tight_layout()
-    fig.savefig(OUT / f"hero-{name}.svg", bbox_inches="tight", transparent=True)
+    fig.savefig(OUT / f"hero-{name}.svg", bbox_inches="tight", facecolor=t["bg"], pad_inches=0.25)
     plt.close(fig)
 
 
@@ -98,7 +99,7 @@ def waterfall(name, t):
     labels = [w[0] for w in WATERFALL][::-1]
     vals = [w[1] for w in WATERFALL][::-1]
     fig, ax = plt.subplots(figsize=(11, 5.6))
-    fig.patch.set_alpha(0)
+    fig.patch.set_facecolor(t["bg"])
     colors = [t["ours"] if i == 0 else (t["base"] if i == len(vals) - 1 else t["ours2"])
               for i in range(len(vals))]
     ax.barh(labels, vals, color=colors, height=0.66)
@@ -115,7 +116,7 @@ def waterfall(name, t):
     fig.text(0.01, -0.03, "T4: шаги до 635 MiB мерили на Brev, дальше - Kaggle A/B; база и итог 463 MiB - "
              "официальные замеры на Kaggle", color=t["muted"], fontsize=9)
     fig.tight_layout()
-    fig.savefig(OUT / f"memory-{name}.svg", bbox_inches="tight", transparent=True)
+    fig.savefig(OUT / f"memory-{name}.svg", bbox_inches="tight", facecolor=t["bg"], pad_inches=0.25)
     plt.close(fig)
 
 

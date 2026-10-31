@@ -5,11 +5,7 @@
 **Шаг обучения Qwen2.5-1.5B (NF4 + LoRA) на своих Triton-кернелах:<br>
 тот же адаптер на тех же батчах - в 1,8 раза быстрее и в 31 раз меньше памяти GPU**
 
-[![speedup](https://img.shields.io/badge/speedup-1.815x-1a7f37?style=for-the-badge)](#kaggle-t4-засчитываемый-замер)
-[![memory](https://img.shields.io/badge/memory-30.98x%20less-1a7f37?style=for-the-badge)](#откуда-31x-по-памяти)
-[![GPU peak](https://img.shields.io/badge/GPU%20peak-463%20MiB-0969da?style=for-the-badge)](#откуда-31x-по-памяти)
-[![check_rules](https://img.shields.io/badge/check__rules-10%2F10-1a7f37?style=for-the-badge)](#kaggle-t4-засчитываемый-замер)
-[![eval loss](https://img.shields.io/badge/eval%20loss-%2B0.003%25-8250df?style=for-the-badge)](#kaggle-t4-засчитываемый-замер)
+[![speedup](https://img.shields.io/badge/speedup-1.815x-1a7f37?style=for-the-badge)](#kaggle-t4-засчитываемый-замер) [![memory](https://img.shields.io/badge/memory-30.98x%20less-1a7f37?style=for-the-badge)](#откуда-31x-по-памяти) [![GPU peak](https://img.shields.io/badge/GPU%20peak-463%20MiB-0969da?style=for-the-badge)](#откуда-31x-по-памяти) [![check_rules](https://img.shields.io/badge/check__rules-10%2F10-1a7f37?style=for-the-badge)](#kaggle-t4-засчитываемый-замер) [![eval loss](https://img.shields.io/badge/eval%20loss-%2B0.003%25-8250df?style=for-the-badge)](#kaggle-t4-засчитываемый-замер)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.svg">
