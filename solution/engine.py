@@ -1659,8 +1659,9 @@ class FusedQwen2:
         lse = self.attns.extra if self.attns is not None and self.attns.ring is not None else 0
         return torch.cuda.memory_allocated(self.device) + work + inputs + lse
 
-    HELD_BASE = 142 * 2**20  # _held_peak: measured on a T4 (public rows, 988-1427 tokens) as
-    HELD_PER_TOKEN = 24 * 1024  # 130 MiB + 22 KiB per token above the memory allocated; + 12 MiB
+    HELD_BASE = 115 * 2**20  # _held_peak: measured on a T4 (public rows, 579-1427 tokens, the
+    HELD_PER_TOKEN = 25 * 1024  # step cap at 340 MiB) as 105 MiB + 25 KiB per token above the
+    # memory allocated, + 10 MiB
 
     def _held_peak(self, n):
         """The peak of a step of n tokens in which no layer keeps anything on the GPU: every
@@ -1831,6 +1832,7 @@ class FusedQwen2:
         cols = 2 * self.layers[0].I
         if self.attns is not None:
             self.attns.release()
+        held = 0  # bytes of a GuStream chunk ring taken by _held_peak, not the plan's prediction
         if self.gus is not None:
             self.gus.release()
             if self.layers_to_keep(packed.n) < L:
@@ -1857,7 +1859,10 @@ class FusedQwen2:
                     if packed.attns is not None:  # only beside a ring of whole outputs: freed
                         self.attns.release()  # before the chunks' check, which it would skew
                         packed.attns = None
-                    if not self.lean(packed.n, chunks):
+                    if not self.lean(packed.n, chunks) or self._held_fits(packed.n, chunks):
+                        # (the plan's prediction may leave out a step that fits by _held_peak:
+                        # its [gate | up] would be recomputed in every layer)
+                        held = 0 if not self.lean(packed.n, chunks) else chunks
                         self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
                         packed.gus = self.gus
         late_attn = 0  # bytes of an AttnStream ring the check below took
@@ -1879,7 +1884,7 @@ class FusedQwen2:
         packed.keep_all_from = L - k_all
         packed.mlp_chunk = self.mlp_chunk
         # (a late AttnStream ring is left out of the lean check: it was taken by _held_peak)
-        packed.lean = k_gu == 0 and self.lean(packed.n, -late_attn)
+        packed.lean = k_gu == 0 and self.lean(packed.n, -late_attn - held)
         if packed.gus is not None:
             packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
         if packed.attns is not None:
