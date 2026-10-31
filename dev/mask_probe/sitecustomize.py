@@ -58,6 +58,7 @@ def _install_base():
         if off0 not in seen:
             seen.add(off0)
             rec["zeros_in"] = int((x == 0).sum())
+            rec["xnz"] = np.packbits((x != 0).reshape(-1).cpu().numpy())
             rec["mask"] = np.packbits((out != 0).reshape(-1).cpu().numpy())
         records.append(rec)
         return out
