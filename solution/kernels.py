@@ -323,9 +323,16 @@ def lm_head_ce_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, correct_ptr
     t = tl.zeros((), tl.float32)
     best = tl.full((), float("-inf"), tl.float32)
     best_idx = tl.zeros((), tl.int32)
+    target = tl.load(target_ptr + row)
+    valid = target >= 0
+    # The target's logit is taken from the block that holds it, as the row is read: once a warp
+    # is past this loop it overwrites the row with the gradient, so a load from the row after
+    # it could see another warp's gradient instead of the logit.
+    x_t = tl.zeros((), tl.float32)
     for start in range(0, V, BLOCK):
         inside = start + cols < V
         x = tl.load(src + start + cols, mask=inside, other=float("-inf")).to(tl.float32)
+        x_t += tl.sum(tl.where(start + cols == target, x, 0.0), axis=0)
         block_max = tl.max(x, axis=0)
         block_arg = tl.argmax(x, axis=0)
         best_idx = tl.where(block_max > best, start + block_arg, best_idx)  # first max wins
@@ -338,9 +345,6 @@ def lm_head_ce_kernel(logits_ptr, target_ptr, loss_ptr, entropy_ptr, correct_ptr
         m = m_new
     lse = m + tl.log(s)
     tl.store(entropy_ptr + row, lse - t / s)
-    target = tl.load(target_ptr + row)
-    valid = target >= 0
-    x_t = tl.load(src + tl.maximum(target, 0)).to(tl.float32)
     tl.store(loss_ptr + row, tl.where(valid, lse - x_t, 0.0))
     tl.store(correct_ptr + row, (valid & (best_idx == target)).to(tl.int32))
     if valid:
@@ -378,9 +382,15 @@ def lm_head_piece_kernel(logits_ptr, w_ptr, target_ptr, state_ptr, best_idx_ptr,
     best = tl.load(state_ptr + row * 4 + 3)
     best_idx = tl.load(best_idx_ptr + row)
     m_old = m
+    target = tl.load(target_ptr + row)
+    local = target - v0
+    # the target's logit, from the block that holds it (as in lm_head_ce_kernel: after this loop
+    # the rows below n_sup are overwritten)
+    x_t = tl.zeros((), tl.float32)
     for start in range(0, width, BLOCK):
         inside = start + cols < width
         x = tl.load(src + start + cols, mask=inside, other=float("-inf")).to(tl.float32)
+        x_t += tl.sum(tl.where(start + cols == local, x, 0.0), axis=0)
         block_max = tl.max(x, axis=0)
         block_arg = tl.argmax(x, axis=0)
         best_idx = tl.where(block_max > best, v0 + start + block_arg, best_idx)  # first max wins
@@ -396,10 +406,8 @@ def lm_head_piece_kernel(logits_ptr, w_ptr, target_ptr, state_ptr, best_idx_ptr,
     tl.store(state_ptr + row * 4 + 2, t)
     tl.store(state_ptr + row * 4 + 3, best)
     tl.store(best_idx_ptr + row, best_idx)
-    target = tl.load(target_ptr + row)
-    local = target - v0
     if (target >= 0) & (local >= 0) & (local < width):
-        tl.store(xt_ptr + row, tl.load(src + local).to(tl.float32))
+        tl.store(xt_ptr + row, x_t)
         hcols = tl.arange(0, HBLOCK)
         for h0 in range(0, H, HBLOCK):
             inh = h0 + hcols < H

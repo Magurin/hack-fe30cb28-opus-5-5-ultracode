@@ -86,6 +86,43 @@ def test_piece_kernels_match_ce_kernel(n, n_prompt):
         assert err_b < 1e-3 and err_b <= 1.5 * err_a, (err_a.item(), err_b.item())
 
 
+def test_ce_kernels_take_the_target_logit_before_the_row_is_overwritten():
+    """Over many launches of both CE kernels every token's loss is logsumexp - its target's logit.
+    (A read of the target's logit after the first loop raced with the warps that had already
+    written the gradient over the row: now and then a loss came out off by about the logit.)"""
+    from solution import kernels as K
+    from solution.engine import CE_BLOCK, HostHead
+
+    V, H, n, n_prompt = 151936, 1536, 1024, 300
+    h, _, weight, packed = _head_inputs(n, n_prompt, V, H, seed=5)
+    order, n_sup = packed.head_order, packed.n_supervised
+    targets = packed.targets.index_select(0, order)
+    logits = h.index_select(0, order).to(torch.float16) @ weight.t()
+    lf = logits.float()
+    exact = torch.logsumexp(lf, -1) - lf.gather(1, targets.clamp(min=0)[:, None])[:, 0]
+    exact = torch.where(targets >= 0, exact, 0.0)
+    for _ in range(10):
+        loss = torch.empty(n, device=DEV)
+        ent = torch.empty(n, device=DEV)
+        cor = torch.empty(n, device=DEV, dtype=torch.int32)
+        K.lm_head_ce_kernel[(n,)](logits.clone(), targets, loss, ent, cor, V, 1,
+                                  BLOCK=CE_BLOCK, num_warps=8)
+        assert (loss - exact).abs().max() < 1e-3
+        state = torch.tensor([float("-inf"), 0.0, 0.0, float("-inf")], device=DEV).repeat(n, 1)
+        best_idx = torch.zeros(n, device=DEV, dtype=torch.int32)
+        xt = torch.zeros(n, device=DEV)
+        alpha = torch.empty(n_sup, device=DEV)
+        wt = torch.zeros((n_sup, H), device=DEV, dtype=torch.float16)
+        for v0 in range(0, V, HostHead.PIECE):
+            width = min(HostHead.PIECE, V - v0)
+            K.lm_head_piece_kernel[(n,)](logits[:, v0:v0 + width].contiguous(),
+                                         weight[v0:v0 + width], targets, state, best_idx, xt,
+                                         alpha, wt, v0, width, n_sup, H, BLOCK=CE_BLOCK,
+                                         HBLOCK=2048, num_warps=8)
+        piece_loss = torch.where(targets >= 0, state[:, 0] + torch.log(state[:, 1]) - xt, 0.0)
+        assert (piece_loss - exact).abs().max() < 1e-3
+
+
 @pytest.mark.parametrize("n,n_prompt", [(820, 300), (300, 120), (37, 37)])
 def test_streamed_head_matches_head(n, n_prompt):
     """The streamed head against the GPU head end to end. The logits GEMM runs on pieces of the
