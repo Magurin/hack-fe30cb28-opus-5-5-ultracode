@@ -400,6 +400,32 @@ def test_fused_step_dropout_matches_hf(tmp_path, lengths):
         assert rel < 2e-2, rel.item()
 
 
+def test_dropout_self_check(tmp_path):
+    """The first step checks our masks against PyTorch's kernel on a generator of its own
+    (the default one stays where it was); if they differed, every step would raise
+    UnsupportedBatch, so the run goes on with the original code path."""
+    from solution.engine import FusedQwen2, TorchDropout, UnsupportedBatch
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    drop = TorchDropout(torch.device(DEV), torch.float32)
+    torch.cuda.manual_seed(3)
+    for shape in ((4, 512, 1536), (3, 7, 1536), (1, 37, 256)):
+        assert drop.check(*shape, 0.05)
+    assert gen.get_offset() == 0
+
+    ids = torch.randint(0, 3000, (2, 9), device=DEV)
+    mask = torch.ones_like(ids)
+    engine = FusedQwen2(model)
+    engine.dropout.check = lambda *args: False
+    with pytest.raises(UnsupportedBatch):
+        engine.step(ids, mask, ids, 10.0)
+    with pytest.raises(UnsupportedBatch):  # and every later step
+        engine.step(ids, mask, ids, 10.0)
+    engine.restore_weights()
+
+
 def test_weight_streaming_is_exact(tmp_path):
     from solution.engine import FusedQwen2
 

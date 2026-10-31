@@ -32,6 +32,7 @@ and offset, in backward again instead of storing them.
 """
 
 import threading
+import warnings
 
 import torch
 import triton
@@ -660,7 +661,11 @@ class TorchDropout:
 
     BLOCK, UNROLL = 256, 4  # Dropout.cu: block_size, UNROLL
 
+    CHECK_SEED = 20261031  # the self-check's own generator
+
     def __init__(self, device, dtype):
+        self.device, self.dtype = device, dtype
+        self.ok = None  # the self-check's verdict (check), once the first step has run it
         props = torch.cuda.get_device_properties(device)
         self.max_blocks = props.multi_processor_count \
             * (props.max_threads_per_multi_processor // self.BLOCK)
@@ -680,6 +685,29 @@ class TorchDropout:
         if seed >= 2**63:  # the kernels take it as int64, its bits as they are
             seed -= 2**64
         return seed, offset // 4, blocks * self.BLOCK
+
+    def check(self, B, T, H, p):
+        """Whether our kernel's mask is PyTorch's on this GPU and build: the rms kernel's
+        dropout of ones over [B, T, H] (a step's LoRA input) against the dropout kernel
+        nn.Dropout runs (dropout_cuda, here through torch._fused_dropout, which takes a
+        generator), both on a generator of their own - the default one is not touched."""
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(self.CHECK_SEED)
+        ones = torch.ones((B, T, H), device=self.device, dtype=self.dtype)
+        _, ref = torch._fused_dropout(ones, 1.0 - p, gen)
+        nelem = B * T * H
+        blocks = min(self.max_blocks, (nelem + self.BLOCK - 1) // self.BLOCK)
+
+        class _Check:
+            dropout_p, drop_seed, drop_threads, drop_vec = p, self.CHECK_SEED, \
+                blocks * self.BLOCK, self.vec
+            tok = torch.arange(B * T, device=self.device)
+            eps = 1e-6
+
+        x = ones.view(B * T, H).float()
+        _, _, yq, _, _ = _rms_fwd(_Check, x, torch.ones(H, device=self.device), _Check,
+                                  write_y=False, seeds=(0, 0), drop_q=True)
+        return bool(torch.equal((yq != 0).view(B, T, H), ref.bool()))
 
 
 class RopeTable:
@@ -1594,6 +1622,14 @@ class FusedQwen2:
         layers before the end of the forward."""
         packed = Packed(input_ids, attention_mask, labels, self.rope, self.dropout,
                         self.dropout_p)
+        if self.dropout is not None and self.dropout.ok is None:
+            self.dropout.ok = self.dropout.check(packed.rows, packed.T, self.layers[0].H,
+                                                 self.dropout_p)
+            if not self.dropout.ok:
+                warnings.warn("solution: our LoRA dropout masks are not PyTorch's on this GPU / "
+                              "build; training with the original code path")
+        if self.dropout is not None and not self.dropout.ok:
+            raise UnsupportedBatch("LoRA dropout masks differ from PyTorch's (TorchDropout.check)")
         if self.lora_views:
             with torch.no_grad():
                 torch._foreach_copy_(self.lora_views, self.lora_fp32)

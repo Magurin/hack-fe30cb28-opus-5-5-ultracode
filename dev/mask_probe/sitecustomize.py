@@ -19,6 +19,8 @@ import sys
 OUT = os.environ.get("MASK_PROBE_OUT")
 STEPS = int(os.environ.get("MASK_PROBE_STEPS", "3"))
 CALLS_PER_STEP = int(os.environ.get("MASK_PROBE_CALLS", "56"))  # 28 layers x (q, v)
+# MASK_PROBE_MASKS < MASK_PROBE_STEPS: masks for that many steps, then the generator state only
+MASKS = int(os.environ.get("MASK_PROBE_MASKS", str(STEPS)))
 
 records = []
 seen = set()
@@ -50,12 +52,14 @@ def _install_base():
         off0 = g.get_offset()
         if off0 not in seen and len(seen) >= STEPS * CALLS_PER_STEP:
             _done()
+        if len(seen) >= MASKS * CALLS_PER_STEP:
+            seen.add(off0)
         out = orig(self, x)
         off1 = g.get_offset()
         rec = dict(kind="base", id=id(self), shape=tuple(x.shape), dtype=str(x.dtype),
                    contig=x.is_contiguous(), align=x.data_ptr() % 64, seed=g.initial_seed(),
                    off0=off0, off1=off1, grad=torch.is_grad_enabled(), p=self.p)
-        if off0 not in seen:
+        if off0 not in seen and len(seen) < MASKS * CALLS_PER_STEP:
             seen.add(off0)
             rec["zeros_in"] = int((x == 0).sum())
             rec["xnz"] = np.packbits((x != 0).reshape(-1).cpu().numpy())
@@ -90,6 +94,8 @@ def _patch_engine(E):
             if len(seen) >= STEPS * CALLS_PER_STEP:
                 _done()
             seen.add(s)
+            if len(seen) > MASKS * CALLS_PER_STEP:
+                continue
             y = res[1]
             records.append(dict(kind="ours", which=which, layer=spec.index, ctr=s,
                                 rows=packed.rows, T=packed.T, H=x.shape[1],
