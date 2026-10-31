@@ -1175,8 +1175,10 @@ def _head_streamed(h, norm_w, eps, head, packed, denom, stats):
     hp = h.index_select(0, order)
     targets = packed.targets.index_select(0, order)
     _, hn, _, _, rstd = _rms_fwd(spec, hp, norm_w, packed)
-    state = torch.tensor([float("-inf"), 0.0, 0.0, float("-inf")], device=dev,
-                         dtype=torch.float32).repeat(n, 1)
+    # every row's (max, sum of exp, sum of exp * logit, best logit) = (-inf, 0, 0, -inf), filled
+    # on the device: a torch.tensor from host memory would wait for the whole forward first
+    state = torch.full((n, 4), float("-inf"), device=dev, dtype=torch.float32)
+    state[:, 1:3] = 0.0
     best_idx = torch.zeros((n,), device=dev, dtype=torch.int32)
     xt = torch.zeros((n,), device=dev, dtype=torch.float32)
     alpha = torch.empty((max(n_sup, 1),), device=dev, dtype=torch.float32)
