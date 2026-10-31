@@ -660,8 +660,10 @@ triton 3.6.0, datasets 4.8.5 уже стоят в образе, ноутбук �
 закрепления pip сейчас ставит torch 2.15.0 + triton 3.9.0 (CUDA 13). Решение работает и там (чистый
 клон и свежий venv на Brev T4, `b102d99`: 37 тестов `solution/`, 79 тестов Soup, все 10 проверок,
 1,581x / 17,66x, eval -0,009%), но засчитывается замер на версиях Kaggle. Команда ниже проверена так
-же - в чистом venv ставит ровно эти версии, `pip check` чистый, тесты passed (тоже `b102d99`). Python 3.13
-на Ubuntu 22.04 по умолчанию нет; мы брали его через `uv python install 3.13`.
+же на `e05874a`: чистый клон, свежий venv, ставятся ровно 2.11.0+cu128 / 3.6.0, `pip check` чистый,
+`pytest solution` - 51 passed, 79 тестов Soup passed, `run_task.py --repeats 2` на Brev T4 - все 10
+проверок, пик 597 MiB (24,03x), eval -0,005% (speedup на Brev 1,392x, с Kaggle не сравнивается).
+Python 3.13 на Ubuntu 22.04 по умолчанию нет; мы брали его через `uv python install 3.13`.
 
 ```bash
 python3.13 -m venv .venv && . .venv/bin/activate
