@@ -1417,6 +1417,7 @@ class FusedQwen2:
         all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers or of
         the embedding (if anything runs the model afterwards) brings them back to the GPU first."""
         self.head = None
+        GuStream.pages = None  # if no step took it
         if self.gus is not None:
             self.gus.unregister()
         if self.stream is None and self.embed.device == self.device:

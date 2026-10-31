@@ -243,6 +243,15 @@ def start_from_command_line(argv):
         start(base)
 
 
+def discard_pages():
+    """Drop the [gate | up] host buffer faulted in for a fused step that was not installed."""
+    if _pages is not None:
+        _pages.join()
+        from . import engine as E
+
+        E.GuStream.pages = None
+
+
 def wait(timeout=300):
     """Join the warm-up thread; returns (seconds waited here, seconds the warm-up took)."""
     started = time.perf_counter()

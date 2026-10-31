@@ -549,6 +549,9 @@ def patch_soup():
 
             hostload.restore(getattr(trainer, "model", None) or getattr(self, "model", None))
             offload.restore_embeddings()
+            from . import warmup
+
+            warmup.discard_pages()
         return original_train(self, *args, **kwargs)
 
     train._soup_kernels_patched = True
