@@ -152,7 +152,8 @@ def s4_kernels(fig):
     ax.set_title("Наши кернелы: вместе 17,5% (порог 5%)", fontsize=14, loc="left")
     bullets(fig, ["Ни одного tl.dot; пример шаблона удалён.",
                   "rms_fwd за один проход: residual add, RMSNorm в fp32, каст в fp16 и входы обеих "
-                  "LoRA с dropout; маска - функция seed и позиции, в backward генерируется заново.",
+                  "LoRA с dropout; маска бит в бит как у nn.Dropout базы (тот же поток Philox от "
+                  "генератора CUDA), не хранится, в backward считается заново.",
                   "Шаг на GPU: GEMM cuBLAS ~69% работы; GPU занят 82-88%: щели между мелкими "
                   "запусками ~20 мс/шаг, граница шага тренера HF 8-15 мс.",
                   "Идеи (код наш): Liger-Kernel, Unsloth, Cut Cross-Entropy, QLoRA, online softmax, "
