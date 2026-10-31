@@ -42,8 +42,8 @@ NF4_LEVELS = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.394917488098144
 
 @triton.jit
 def _nf4_level(n):
-    """NF4 code -> level with a select tree on constants: no table loads (on Turing the per-
-    element gathers, not the bytes, were what limited the first version of this kernel)."""
+    """NF4 code -> level with a select tree on constants: no table loads (on Turing a
+    per-element gather from a table costs more than the bytes it reads)."""
     b0 = (n & 1) != 0
     b1 = (n & 2) != 0
     b2 = (n & 4) != 0

@@ -5,11 +5,13 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
 
 1. pad tokens are dropped: the rows of the batch are packed into one (N, H) sequence (N = real
    tokens), attention runs varlen over the packed rows, so no work and no memory goes to padding;
-2. every decoder layer is one autograd.Function (`_Layer`) that keeps only its input, the fp32
-   residual (6 KiB per token), and recomputes the rest of its forward in backward: about 6x less
-   activation memory than keeping the attention and MLP intermediates, for one extra pass of
-   the qkv, o and gate/up GEMMs. NF4 weights are dequantized by our kernel once in forward and
-   once in backward (as bitsandbytes does); the backward reuses them for the recomputation;
+2. every decoder layer is one autograd.Function (`_Layer`). Within the step's memory cap
+   (`FusedQwen2.keep_plan`) the last layers keep their [gate | up] GEMM output, then every
+   intermediate; the others recompute their forward in backward from their input, the fp32
+   residual (6 KiB per token and layer). A step too long for the cap runs lean
+   (`FusedQwen2.lean`): nothing kept, the MLP over MLP_CHUNK tokens at a time. NF4 weights are
+   dequantized by our kernel once in forward and once in backward (as bitsandbytes does); the
+   backward reuses them for the recomputation;
 3. the final norm, lm_head, cross-entropy and the metrics TRL / Soup log (entropy, token accuracy,
    per-row loss) are one chunked pass (`_Head`): logits exist for a chunk of rows at a time and the
    gradient w.r.t. the hidden state is formed in the same pass;
@@ -17,7 +19,10 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
    one layer ahead of the compute (`WeightStream`);
 5. the frozen, tied embedding / lm_head weight (445 MiB in fp16) stays in pinned host memory
    (`HostHead`): the step's embedding rows are gathered on the CPU, the lm_head is streamed in
-   pieces of the vocabulary while the head runs over them (`_head_streamed`).
+   pieces of the vocabulary while the head runs over them (`_head_streamed`);
+6. the layer inputs (`InputStream`) and the [gate | up] outputs of the layers that do not keep
+   them (`GuStream`) wait in pinned host memory between forward and backward, copied out and
+   back on side streams while the layers compute (`_HostRing`).
 
 The math is the base's: the same fp16 roundings at the same places (projection outputs, attention
 inputs, the MLP product), fp32 for the residual, the norms, RoPE, softmax and the loss. The LoRA
@@ -35,8 +40,8 @@ from . import kernels as K
 NF4_ROWS = 32  # quantization blocks (of 64 values) per program
 GLU_BLOCK = 1024  # columns of the MLP output per SwiGLU program
 CE_BLOCK = 4096  # vocabulary entries per loop iteration of the cross-entropy kernel
-HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 78 MiB
-MLP_CHUNK = 512  # tokens of [gate | up] alive at a time in a lean step (FusedQwen2.keep_plan)
+HEAD_CHUNK = 256  # rows of logits alive at a time: 256 x 151936 fp16 = 74 MiB
+MLP_CHUNK = 512  # tokens of [gate | up] alive at a time in a lean step (FusedQwen2.lean)
 
 
 _COMPILE_ONLY = threading.local()  # set by solution/warmup.py in its compile threads
@@ -153,8 +158,8 @@ class WeightStream:
     """The packed NF4 weights of every decoder layer live in pinned host memory during training;
     a layer's bytes are copied into one of three device slots on a side stream, one layer ahead
     of the compute (forward: i+1, backward: i-1). Slot i % 3 is only overwritten after the
-    compute stream has finished with the layer that held it before. 24 MiB per Qwen2.5-1.5B
-    layer, so 72 MiB on the GPU instead of ~650 MiB, for ~1.3 GB of PCIe traffic per step that
+    compute stream has finished with the layer that held it before. 23 MiB per Qwen2.5-1.5B
+    layer, so 69 MiB on the GPU instead of ~645 MiB, for ~1.3 GB of PCIe traffic per step that
     runs alongside the GEMMs."""
 
     SLOTS = 3
@@ -419,7 +424,7 @@ class GuStream(_HostRing):
     GPU are fewer by its size: their forward, with the whole ring allocated, is where a step
     with the layer inputs in host memory peaks.
 
-    The 2 GiB host buffer is costly to pin (~0.95 s on a T4 host, most of it faulting the pages
+    The 1.9 GiB host buffer is costly to pin (~0.95 s on a T4 host, most of it faulting the pages
     in, which holds up the training even on another thread): a thread of warmup.py faults it in
     as plain memory while the model loads (`pages`), and the first step pins it in place
     (~0.1 s)."""
@@ -451,7 +456,7 @@ class GuStream(_HostRing):
                 self.host = self.registered = pages
         if self.host is not None and self.host.shape[1] < n:
             self.unregister()  # _host_rows makes a bigger one
-        self._host_rows(n, cols, torch.float16)  # 2 GiB for 2048 tokens
+        self._host_rows(n, cols, torch.float16)  # 1.9 GiB for 2048 tokens
         self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
         self.n = n
         self.upto = 0
@@ -552,7 +557,7 @@ class Packed:
         self.keep_all_from = 1 << 30  # ... and from this one every intermediate
         self.inputs = None  # an InputStream, if the layer inputs wait in host memory
         self.gus = None  # a GuStream, if [gate | up] of the layers below gus.upto does
-        self.lean = False  # recompute and run the MLP in parts (FusedQwen2.keep_plan)
+        self.lean = False  # recompute and run the MLP in parts (FusedQwen2.lean)
         self.mlp_chunk = MLP_CHUNK
 
     def lora16(self, index, weights):
@@ -679,7 +684,7 @@ def _lora_scale(spec):
 
 
 def _dummy16(device):
-    """A one-element fp16 tensor standing in for an output or input a launch does not use, so
+    """A small fp16 tensor standing in for an output or input a launch does not use, so
     every launch of a kernel has the same argument types (one compiled variant)."""
     t = _DUMMIES.get(device)
     if t is None:
@@ -892,9 +897,12 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
 
 
 class _Layer(torch.autograd.Function):
-    """One decoder layer. Only its input (the fp32 residual) is kept for backward; the backward
-    runs the forward again up to the MLP input, with the same dropout seeds, and then goes back
-    through it. The LoRA weights are inputs, so autograd hands their gradients to the optimizer."""
+    """One decoder layer. Its input (the fp32 residual) is kept for backward, on the GPU or in
+    host memory (InputStream), and, as the step's plan allows (FusedQwen2.keep_plan), its
+    [gate | up] GEMM output (on the GPU or in host memory, GuStream) or every intermediate. The
+    backward runs the forward again, with the same dropout seeds, as far as it has to (up to the
+    MLP input, or none of it), in two parts in a lean step, and then goes back through it. The
+    LoRA weights are inputs, so autograd hands their gradients to the optimizer."""
 
     @staticmethod
     def forward(ctx, h, spec, packed, aq_w, bq_w, ak_w, bk_w, av_w, bv_w):
@@ -906,7 +914,7 @@ class _Layer(torch.autograd.Function):
         offloaded = packed.inputs is not None and packed.inputs.save(spec.index, h)
         if spec.stream is not None:
             spec.stream.acquire(spec.index, spec.index + 1)
-        # What this layer keeps for backward depends on the room the step has (FusedQwen2.step):
+        # What this layer keeps for backward depends on the room the step has (keep_plan):
         # the [gate | up] GEMM output first (most recomputation saved per byte), then every
         # intermediate; the rest is recomputed in backward.
         ctx.kept_gu = ctx.kept_all = None
@@ -1318,6 +1326,15 @@ class FusedQwen2:
         return k_gu, max(0, min(L, left // per_layer))
 
     def _predicted_peak(self, n):
+        """The step's peak if no layer keeps anything: the memory allocated now plus one
+        recomputing layer's backward (its dequantized weights and a working set per token), or
+        the streamed head if that is larger, plus the layer inputs if they stay on the GPU.
+
+        Calibrated with the layer inputs on the GPU (they dominated the peak at the start of
+        backward): measured over a whole run, 65 MiB + 218 KiB per token above the memory
+        allocated when the step starts; this prediction stays 46 MiB + 14 KiB per token above it.
+        With the inputs in host memory a step peaks in the forward of the layers keeping
+        [gate | up]; on a T4 it stays a few MiB under the cap."""
         spec = self.layers[0]
         H, I, L = spec.H, spec.I, len(self.layers)
         # the dequantized qkv, o and [gate | up] weights a recomputing layer's backward holds
@@ -1332,25 +1349,18 @@ class FusedQwen2:
         return torch.cuda.memory_allocated(self.device) + work + inputs
 
     def lean(self, n, extra=0):
-        """Whether a step of n tokens needs the lean recomputation to stay under the cap: on the
-        longest batches (4 x 512 tokens) the plain step's peak (inputs of every layer plus one
-        layer's [gate | up] output and dm) would go above the model-load peak. A lean step keeps
-        nothing and recomputes in two parts (_layer_forward), with [gate | up] alive for
-        MLP_CHUNK tokens at a time: ~205 KiB per token instead of ~250."""
+        """Whether a step of n tokens needs the lean recomputation to stay under the cap (with
+        `extra` bytes more allocated): on the longest batches the plain step's peak (one layer's
+        [gate | up] output and dm on top of what the step holds) would go above it. A lean step
+        keeps nothing and recomputes in two parts (_layer_forward), with [gate | up] alive for
+        MLP_CHUNK tokens at a time."""
         cap = getattr(self, "memory_cap", None)
         return bool(cap) and n > self.mlp_chunk and self._predicted_peak(n) + extra > cap
 
     def layers_to_keep(self, n):
-        """How many layers can keep their [gate | up] output (2 * I fp16 values per token) instead
-        of recomputing that GEMM in backward, without the step's peak reaching the cap.
-
-        The peak of a step is at the start of backward: the layer inputs (L x H fp32 per token)
-        plus one layer's backward working set (about 50 KiB per token) plus the dequantized qkv,
-        o and [gate | up] weights of one layer; measured over a whole run (any keeping
-        subtracted): 65 MiB + 218 KiB per token above the memory allocated when the step starts.
-        The prediction below is from the model's dimensions and stays 46 MiB + 14 KiB per token
-        above that measurement (with 14 MiB a T4 run peaked 16 MiB above the model load in
-        nvidia-smi, with 46 MiB it stays at it)."""
+        """How many layers can keep their [gate | up] output (2 * I fp16 values per token) on the
+        GPU instead of recomputing that GEMM in backward (or, with GuStream, instead of copying
+        it to host memory and back), without the step's predicted peak reaching the cap."""
         cap = getattr(self, "memory_cap", None)
         if not cap or not n:
             return 0
@@ -1416,9 +1426,10 @@ class FusedQwen2:
         self.head = None
 
     def finish_training(self):
-        """Training is over: free the device slots. The weights stay in host memory, which is
-        all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers or of
-        the embedding (if anything runs the model afterwards) brings them back to the GPU first."""
+        """Training is over: free the device slots, drop the HostHead and unregister GuStream's
+        host buffer. The weights stay in host memory, which is all saving a LoRA adapter needs;
+        the first forward call of any of the 4-bit layers or of the embedding (if anything runs
+        the model afterwards) brings them back to the GPU first."""
         self.head = None
         GuStream.pages = None  # if no step took it
         if self.gus is not None:
@@ -1440,6 +1451,8 @@ class FusedQwen2:
             hooks.append(module.register_forward_pre_hook(bring_back))
 
     def restore_weights(self):
+        """Back to Soup's own code (a batch the fused step does not take): the NF4 weights and the
+        embedding on the GPU again, the layer inputs' buffers and GuStream's ring freed."""
         self.restore_head()
         self.inputs = None  # its device ring and pinned buffer (offload_inputs makes them again)
         if self.gus is not None:
@@ -1451,6 +1464,10 @@ class FusedQwen2:
             self.stream = None
 
     def step(self, input_ids, attention_mask, labels, denom, training=True):
+        """One training step's forward: (loss, packed, stats); autograd runs the backward. The
+        InputStream and GuStream rings are allocated before the plan (keep_plan, lean), so the
+        plan counts them; the streamed head fetches its first pieces HostHead.PREFETCH_LAYERS
+        layers before the end of the forward."""
         p = self.dropout_p if training else 0.0
         packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, p)
         if self.lora_views:
