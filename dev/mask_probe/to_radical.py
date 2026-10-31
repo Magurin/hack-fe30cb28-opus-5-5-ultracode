@@ -31,6 +31,9 @@ def pack(dropped):  # capture_base_masks.pack
 def main(src, dst, p=0.05):
     recs = pickle.load(open(src, "rb"))
     draws = [r for r in recs if r["kind"] == "draw"]
+    # whole steps only: the probe stops at the first mask past them, after that step's first
+    # layer has already drawn (q and v) - those draws have no mask recorded
+    draws = draws[:len(draws) // CALLS * CALLS]
     shapes = {}
     for r in recs:
         if r["kind"] == "ours":
