@@ -1,7 +1,7 @@
 """Figures of the README (docs/img/*.svg, a light and a dark variant of each, each on its own
 background so it stays readable whichever GitHub theme shows it).
 
-Numbers: the official Kaggle T4 measurement of bfff00c (version 24 of magurin/soup-kernel-run,
+Numbers: the official Kaggle T4 measurement of 838827f (version 25 of magurin/soup-kernel-run,
 --repeats 2) and the memory waterfall of the README (nvidia-smi peaks on a T4).
 Run: python docs/make_figures.py
 """
@@ -21,8 +21,8 @@ THEMES = {
 }
 plt.rcParams.update({"font.family": "DejaVu Sans", "svg.fonttype": "path", "font.size": 11})
 
-BASE_LOOP, BASE_WALL = 58.62, 80.26
-OURS_LOOP, OURS_WALL = 25.57, 44.22
+BASE_LOOP, BASE_WALL = 57.46, 79.03
+OURS_LOOP, OURS_WALL = 24.73, 42.48
 BASE_PEAK, OURS_PEAK = 14345, 463
 
 WATERFALL = [
@@ -67,7 +67,7 @@ def hero(name, t):
            height=0.56, label="вне цикла: импорт, загрузка, датасет, сохранение")
     for y, w in enumerate(walls):
         a.text(w + 1.2, y, f"{num(w)} с", va="center", color=t["text"], fontsize=12, fontweight="bold")
-    a.text(OURS_WALL + 16, 0, "в 1,815 раза быстрее", va="center", color=t["ours"], fontsize=11)
+    a.text(OURS_WALL + 16, 0, "в 1,860 раза быстрее", va="center", color=t["ours"], fontsize=11)
     a.set_xlim(0, 100)
     a.set_title("Время всей команды soup train, с", loc="left", color=t["text"], fontsize=12.5,
                 fontweight="bold", pad=10)
@@ -87,8 +87,8 @@ def hero(name, t):
                 fontweight="bold", pad=10)
     style(b, t)
     b.tick_params(axis="y", colors=t["text"], labelsize=12)
-    fig.text(0.01, -0.01, "Kaggle T4, Soup 0.77.0, официальный замер bfff00c: run_task.py --repeats 2, "
-             "среднее двух запусков; eval loss +0,003%, все 10 проверок check_rules.py",
+    fig.text(0.01, -0.01, "Kaggle T4, Soup 0.77.0, официальный замер 838827f: run_task.py --repeats 2, "
+             "среднее двух запусков; eval loss -0,003%, все 10 проверок check_rules.py",
              color=t["muted"], fontsize=9)
     fig.tight_layout()
     fig.savefig(OUT / f"hero-{name}.svg", bbox_inches="tight", facecolor=t["bg"], pad_inches=0.25)
