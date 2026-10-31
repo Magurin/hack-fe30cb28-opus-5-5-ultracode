@@ -9,11 +9,9 @@ backward тоже ждут на хосте (последние - вместо п
 Подробно - `README.md`.
 
 ## Links
-- Repository, final code = code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c
-  (`solution_sha256` `9efa8ec1`); `main` has the same code. The late warm-up with NF4 loaded straight
-  into pinned memory (-0.3..-0.85 s out of the loop in Kaggle A/Bs) was tested after the measurement
-  and is not in the final code (no official measurement in time)
-- Public Kaggle notebook of the official measurement (version 24, `bfff00c`: 1.815x / 30.98x, all 10 checks): https://www.kaggle.com/code/magurin/soup-kernel-run
+- Repository, final code = code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/838827f
+  (`solution_sha256` `d39cd6cb`); `main` has the same code
+- Public Kaggle notebook of the official measurement (version 25, `838827f`: 1.860x / 30.98x, all 10 checks): https://www.kaggle.com/code/magurin/soup-kernel-run
 - Demo video (up to 3 minutes): TODO (заполняет команда)
 - Presentation (PDF, 10 slides): https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/blob/main/presentation/slides.pdf
 
@@ -37,7 +35,7 @@ backward тоже ждут на хосте (последние - вместо п
 | `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,5 + 2,7% |
 | `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,70 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **18,0%** (`bfff00c`, меньший из 2 запусков r2; шаблонный прогон - 18,2%; порог 5%) |
+| **Всего** | | | **18,6%** (`838827f`, меньший из 2 запусков r2; шаблонный прогон - 18,8%; порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -54,13 +52,14 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 80,26 | 44,22 | 1,815x speedup |
-| Training loop, 64 steps, s | 58,62 | 25,57 | 2,29x |
+| Time of `soup train`, s (mean of 2 runs) | 79,03 | 42,48 | 1,860x speedup |
+| Training loop, 64 steps, s | 57,46 | 24,73 | 2,32x |
 | Peak GPU memory, MiB | 14 345 | 463 | 30,98x base/ours |
-| Eval loss (public rows) | 2,04964 | 2,04971 | +0,003% vs base |
+| Eval loss (public rows) | 2,04968 | 2,04962 | -0,003% vs base |
 
-Код `bfff00c` (Kaggle, 31.10, версия 24 ноутбука `magurin/soup-kernel-run`; шаблонный прогон той же
-версии - 1,768x / 30,98x). Прошлые официальные замеры тем же ноутбуком (r2, все 10 проверок):
+Код `838827f` (Kaggle, 31.10, версия 25 ноутбука `magurin/soup-kernel-run`; шаблонный прогон той же
+версии - 2,050x / 30,98x при холодной базе 87,0 с). Прошлые официальные замеры тем же ноутбуком (r2, все
+10 проверок): `bfff00c` - 1,815x / 30,98x (463 MiB, `9efa8ec1`, до позднего прогрева, шаблон 1,768x),
 `7962b1d` - 1,777x / 30,98x (463 MiB, `522e22c0`, до быстрого выхода, шаблон 1,972x при холодной базе),
 `a123fba` - 1,8448x / 26,418x (пик 543 MiB, `solution_sha256` `f302c7e6`, медленная сессия, шаблон
 1,964x), `9d31eea` - 1,8322x / 25,48x (563 MiB, `9155f08c`, шаблон 2,005x), `8c584c0` - 1,824x /
@@ -69,7 +68,7 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2), и финальный код токенизирует
 снова `map` Soup (~2-3 с вне цикла).
 
-- [x] All 10 checks of `harness/check_rules.py` passed: да (`bfff00c`, версия 24: и `--repeats 2`, и шаблонный прогон; во всех прошлых официальных замерах
+- [x] All 10 checks of `harness/check_rules.py` passed: да (`838827f`, версия 25: и `--repeats 2`, и шаблонный прогон; во всех прошлых официальных замерах
   - все 10 и в `--repeats 2`, и в шаблонном; проверка 10 - 79 тестов Soup passed)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
@@ -93,9 +92,11 @@ RoPE, SwiGLU, голова кусками словаря с online logsumexp), �
 ## Limitations
 См. README.md, "Ограничения и что не получилось": решение заточено под Qwen2 + NF4 + LoRA на q/v в
 fp16 (иначе исходный код Soup); GEMM cuBLAS ~69% работы GPU и свой GEMM на Triton для T4 не
-получился; вне цикла обучения выигрыш небольшой (~10 с патчами запуска по сумме A/B отдельных
+получился; вне цикла обучения выигрыш небольшой (~11 с патчами запуска по сумме A/B отдельных
 патчей, из них -1,8 с - выход через `os._exit` после всех обработчиков выхода, разрешение
-[t.me/souptasterschat/5199](https://t.me/souptasterschat/5199); своя токенизация без `datasets.map`
+[t.me/souptasterschat/5199](https://t.me/souptasterschat/5199), и ~-0,9 с - прогрев в конце `apply()`,
+дешёвый ключ кэша Triton ([t.me/souptasterschat/2922](https://t.me/souptasterschat/2922), п. 2) и NF4
+загрузчиком прямо в pinned-буфер стриминга; своя токенизация без `datasets.map`
 запрещена и убрана); ниже ~461 MiB пик не опускается:
 ~113-115 MiB - вне аллокатора PyTorch (CUDA-контекст ~65, модуль кастов PyTorch, cuBLAS), а резерв
 аллокатора 346 MiB держит фрагментация (настройки аллокатора харнесса менять нельзя); выгрузки
