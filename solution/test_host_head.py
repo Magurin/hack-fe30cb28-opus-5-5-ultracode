@@ -379,7 +379,7 @@ def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, l
     gradients against recomputing them (GuStream alone), over two steps with the weights, head
     and layer inputs on the host; with 7 layers the ring's slots are written again and the
     backward fetches ahead; with k_gu the last layers keep their [gate | up] on the GPU (and
-    recompute their attention)."""
+    their attention tensors in host memory too, so no layer recomputes its attention)."""
     from solution.engine import AttnStream, FusedQwen2, GuStream
     from solution.patch import _embedding_to_fp16
 
@@ -409,7 +409,7 @@ def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, l
         for ids, mask, labels in batches:
             loss, packed, _ = engine.step(ids, mask, labels, 80.0)
             assert (packed.attns is not None) == attn_on_host
-            assert not attn_on_host or packed.attns.upto == layers - k_gu
+            assert not attn_on_host or packed.attns.upto == layers
             out.append((loss, torch.autograd.grad(loss, params)))
         engine.restore_weights()
         return out
@@ -417,16 +417,17 @@ def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, l
     for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
         assert torch.equal(loss_a, loss_b)
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
-    assert sorted(loaded) == sorted(list(range(layers - k_gu)) * len(batches))
+    assert sorted(loaded) == sorted(list(range(layers)) * len(batches))
 
 
 @pytest.mark.parametrize("case", ["chunks", "lean", "border", "late"])
 def test_attention_ring_only_beside_whole_gate_up_ring(tmp_path, monkeypatch, case):
-    """AttnStream is taken only beside a ring of whole [gate | up] outputs: not on a step whose
-    [gate | up] goes to host memory in chunks, not on a lean step, and not when the GuStream
-    ring fits under the cap but both rings do not (the border, where the ring was once counted
-    twice); its ring is then never left allocated, nothing is loaded from it, and loss and
-    gradients are bit for bit those without it."""
+    """By the plan's prediction AttnStream is taken only beside a ring of whole [gate | up]
+    outputs: not on a step whose [gate | up] goes to host memory in chunks, not on a lean step,
+    and not when the GuStream ring fits under the cap but both rings do not (the border, where
+    the ring was once counted twice); here no step is short enough for _held_peak (no cap), so
+    its ring is then never left allocated, nothing is loaded from it, and loss and gradients are
+    bit for bit those without it."""
     from solution.engine import FusedQwen2, GuStream
     from solution.patch import _embedding_to_fp16
 
@@ -557,3 +558,57 @@ def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
     loss_b, grads_b = run(True)
     assert torch.equal(loss_a, loss_b)
     assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
+@pytest.mark.parametrize("ring", ["chunks", "whole"])
+def test_long_step_attention_in_host_memory_is_exact(tmp_path, monkeypatch, ring):
+    """A long step the plan's prediction leaves without AttnStream (its [gate | up] in host
+    memory in chunks, or a ring of whole outputs that fits but not beside AttnStream's) takes it
+    when _held_peak says the step fits: every layer's attention tensors go to host memory, the
+    step is not lean, and loss and LoRA gradients are bit for bit those of recomputing the
+    attention (the same step without AttnStream)."""
+    from solution.engine import FusedQwen2, GuStream
+    from solution.patch import _embedding_to_fp16
+
+    layers = 7
+    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
+    params = [p for p in model.parameters() if p.requires_grad]
+    monkeypatch.setattr(FusedQwen2, "layers_to_keep", lambda self, n: 0)
+    monkeypatch.setattr(FusedQwen2, "_held_fits", lambda self, n, extra: True)
+    loaded = []
+
+    def run(attn_on_host):
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
+        engine.offload_weights()
+        engine.offload_head()
+        engine.offload_inputs()
+        engine.offload_gus()
+        engine.mlp_chunk = 32
+        if attn_on_host:
+            engine.offload_attns()
+            load = engine.attns.load_attn
+            monkeypatch.setattr(engine.attns, "load_attn",
+                                lambda i, spec: loaded.append(i) or load(i, spec))
+        out = []
+        for ids, mask, labels in batches:
+            whole = GuStream.SLOTS * int(mask.sum()) * 2 * engine.layers[0].I * 2
+            # chunks: the whole ring would make the step lean, the chunks' not; whole: the whole
+            # ring fits, but not beside AttnStream's (by the plan's prediction)
+            monkeypatch.setattr(FusedQwen2, "lean", lambda self, n, extra=0: extra > (
+                whole - 1 if ring == "chunks" else whole))
+            loss, packed, _ = engine.step(ids, mask, labels, 80.0)
+            assert not packed.lean and (packed.gus.chunk == 32) == (ring == "chunks")
+            assert (packed.attns is not None) == attn_on_host
+            assert not attn_on_host or packed.attns.upto == layers
+            out.append((loss, torch.autograd.grad(loss, params)))
+        engine.restore_weights()
+        return out
+
+    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
+        assert torch.equal(loss_a, loss_b)
+        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+    assert sorted(loaded) == sorted(list(range(layers)) * len(batches))

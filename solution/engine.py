@@ -549,16 +549,17 @@ class GuStream(_HostRing):
 
 
 class AttnStream(_HostRing):
-    """What the backward of a layer that loads its [gate | up] from GuStream would otherwise
-    recompute before it: q, k, v (RoPE applied), the attention output and the o_proj output, in
-    pinned host memory between forward and backward, for the layers GuStream holds. The
-    backward then runs only the two RMSNorms again (the LoRA inputs and their dropout masks,
-    the residual after attention from o), not the qkv and o GEMMs, RoPE and the attention: on a
-    T4 ~20 ms of a step. k and v go out as their HKV heads, not the HQ heads the attention
-    reads, and are expanded again after the copy back. The attention's logsumexp and seeds stay
-    on the GPU (a few KiB per layer). Values are copies: the backward is bit for bit the one
-    that recomputes. Its 560 MiB host buffer is faulted in by warmup.py and pinned in place by
-    the first step, as GuStream's."""
+    """What the backward of a layer that has its [gate | up] (from GuStream, whole or in chunks,
+    or kept on the GPU) would otherwise recompute before it: q, k, v (RoPE applied), the
+    attention output and the o_proj output, in pinned host memory between forward and backward,
+    for every layer of a step with a GuStream ring that is not lean. The backward then runs only
+    the two RMSNorms again (the LoRA inputs and their dropout masks, the residual after
+    attention from o), not the qkv and o GEMMs, RoPE and the attention: on a T4 ~20 ms of a
+    step. k and v go out as their HKV heads, not the HQ heads the attention reads, and are
+    expanded again right before the attention backward. The attention's logsumexp and seeds
+    stay on the GPU (a few KiB per layer). Values are copies: the backward is bit for bit the
+    one that recomputes. Its 560 MiB host buffer is faulted in by warmup.py and pinned in place
+    by the first step, as GuStream's."""
 
     pages = None  # [L, HOST_ROWS, cols] fp16 in pageable memory, from warmup.py
 
@@ -634,15 +635,20 @@ class AttnStream(_HostRing):
             self._copy_out(i, self.ring[i % self.SLOTS, :self.n])
 
     def load_attn(self, i, spec):
-        """Backward of layer i: (q, k_e, v_e, out, o, lse, seed, offset) on the current stream."""
+        """Backward of layer i: (q, k, v, out, o, lse, seed, offset) on the current stream; k and
+        v as their HKV heads, expanded by _expand_kv right before the attention backward."""
         q, k, v, out, o = self._views(self.load(i), spec)
-        rep = spec.HQ // spec.HKV
-        shape = (self.n, spec.HKV, rep, spec.D)
-        k_e = k[:, :, None].expand(shape).reshape(self.n, spec.HQ, spec.D)
-        v_e = v[:, :, None].expand(shape).reshape(self.n, spec.HQ, spec.D)
         lse, seed, offset = self.small[i]
         self.small[i] = None
-        return q, k_e, v_e, out, o, lse, seed, offset
+        return q, k, v, out, o, lse, seed, offset
+
+
+def _expand_kv(spec, t):
+    """k or v as the HQ heads the attention reads: [n, HKV, D] repeated for the GQA groups."""
+    if t.shape[1] == spec.HQ:
+        return t
+    n, rep = t.shape[0], spec.HQ // spec.HKV
+    return t[:, :, None].expand((n, spec.HKV, rep, spec.D)).reshape(n, spec.HQ, spec.D)
 
 
 def _pin_in_place(t, device):
@@ -1054,18 +1060,21 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     lora_scale = _lora_scale(spec)
     saved = {}
 
-    # input RMSNorm (+ the dropout'ed copies the LoRA A matrices read)
-    _, a, aq, av, rstd1 = _rms_fwd(spec, h, spec.ln1, packed, seeds=seeds,
+    # input RMSNorm (+ the dropout'ed copies the LoRA A matrices read; with the attention
+    # tensors from host memory, only those: its output feeds the qkv GEMM alone)
+    _, a, aq, av, rstd1 = _rms_fwd(spec, h, spec.ln1, packed, seeds=seeds, write_y=attn is None,
                                    drop_q=aq_w is not None, drop_v=av_w is not None)
 
-    # q, k, v in one GEMM; LoRA as two thin GEMMs per target
-    w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
+    # q, k, v in one GEMM; LoRA as two thin GEMMs per target. With the attention tensors from
+    # host memory the backward dequantizes the qkv and o weights itself, right before their
+    # GEMMs (not held through its MLP part)
     if attn is None:
+        w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
         qkv = torch.addmm(spec.bias_qkv, a, w.t())
+        if keep:
+            saved["w_qkv"] = w
+        del w
     del a
-    if keep:
-        saved["w_qkv"] = w
-    del w
     xq = xv = lq = lv = None
     if aq_w is not None:
         xq = aq @ aq_w.t()
@@ -1089,20 +1098,22 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         saved.pop("w_qkv", None)
         del aq, av, xq, xv, q, k, v, k_e, v_e, lse
 
-    w = dequant([spec.w["o_proj"]], dev)
     if attn is None:
+        w = dequant([spec.w["o_proj"]], dev)
         o = out.reshape(n, HQ * D) @ w.t()
-    if keep:
-        saved["w_o"] = w
-    del w
-    h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
+        if keep:
+            saved["w_o"] = w
+        del w
+    chunks = packed.gus is not None and packed.gus.chunk and packed.gus.holds(spec.index)
+    # (the MLP input b is not needed by a recomputation that has [gate | up] already)
+    h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o,
+                                  write_y=not (keep and (gu is not None or chunks)))
     if not keep and part is None and packed.attns is not None \
             and packed.attns.holds(spec.index):
         packed.attns.save(spec.index, spec, q, k_e, v_e, out, o, lse, aseed, aoffset)
     del o
     if part == "mlp_input":
         return None, {"h2": h2, "rstd2": rstd2, "b": b}
-    chunks = packed.gus is not None and packed.gus.chunk and packed.gus.holds(spec.index)
     if return_gu and gu is None and not keep and not full and not packed.lean:
         # a layer keeping its [gate | up] on the GPU: the step peaks in these layers' forward,
         # so their GEMM goes in two halves, gate then up, each weight dequantized right before
@@ -1248,7 +1259,9 @@ class _Layer(torch.autograd.Function):
                         and not packed.gus.chunk:
                     gu = packed.gus.load(spec.index)
                 attn = None
-                if gu is not None and packed.attns is not None \
+                chunked = packed.gus is not None and packed.gus.chunk \
+                    and packed.gus.holds(spec.index)  # its [gate | up] comes back in chunks
+                if (gu is not None or chunked) and packed.attns is not None \
                         and packed.attns.holds(spec.index):
                     attn = packed.attns.load_attn(spec.index, spec)
                 with torch.no_grad():
@@ -1280,7 +1293,8 @@ class _Layer(torch.autograd.Function):
         w = f.pop("w_o") if "w_o" in f else dequant([spec.w["o_proj"]], dev)
         dout = (dh2.to(torch.float16) @ w).view(n, HQ, D)
         del w
-        dq, dk, dv = _attn_bwd(dout, f.pop("q"), f.pop("k_e"), f.pop("v_e"), f.pop("out"),
+        dq, dk, dv = _attn_bwd(dout, f.pop("q"), _expand_kv(spec, f.pop("k_e")),
+                               _expand_kv(spec, f.pop("v_e")), f.pop("out"),
                                f.pop("lse"), f.pop("aseed"), f.pop("aoffset"), packed, spec.scale)
         del dout
         dqkv = _rope_bwd(spec, dq, dk, dv, packed)
@@ -1647,6 +1661,23 @@ class FusedQwen2:
         lse = self.attns.extra if self.attns is not None and self.attns.ring is not None else 0
         return torch.cuda.memory_allocated(self.device) + work + inputs + lse
 
+    HELD_BASE = 142 * 2**20  # _held_peak: measured on a T4 (public rows, 988-1427 tokens) as
+    HELD_PER_TOKEN = 24 * 1024  # 130 MiB + 22 KiB per token above the memory allocated; + 12 MiB
+
+    def _held_peak(self, n):
+        """The peak of a step of n tokens in which no layer keeps anything on the GPU: every
+        layer's [gate | up] (whole or in chunks) waits in host memory, so no backward
+        recomputes that GEMM, and the step peaks in one layer's backward (its dequantized
+        weights, dm and its attention backward) or in the head. Measured, not modelled:
+        _predicted_peak's working set (calibrated with the layer inputs on the GPU and a
+        recomputing backward) is 20-35 MiB above it on such steps."""
+        return torch.cuda.memory_allocated(self.device) + self.HELD_BASE + n * self.HELD_PER_TOKEN
+
+    def _held_fits(self, n, extra):
+        """Whether such a step, with `extra` bytes more allocated, stays under the cap."""
+        cap = getattr(self, "memory_cap", None)
+        return bool(cap) and self._held_peak(n) + extra <= cap
+
     def lean(self, n, extra=0):
         """Whether a step of n tokens needs the lean recomputation to stay under the cap (with
         `extra` bytes more allocated): on the longest batches the plain step's peak (one layer's
@@ -1715,8 +1746,8 @@ class FusedQwen2:
             self.gus = GuStream(len(self.layers), self.device)
 
     def offload_attns(self):
-        """Keep the attention tensors of the layers GuStream holds in pinned host memory too
-        (AttnStream): their backward recomputes nothing but the two RMSNorms."""
+        """Keep the attention tensors of the layers in pinned host memory too, on steps with a
+        GuStream ring (AttnStream): their backward recomputes nothing but the two RMSNorms."""
         if self.attns is None:
             self.attns = AttnStream(len(self.layers), self.device)
 
@@ -1830,15 +1861,29 @@ class FusedQwen2:
                     if not self.lean(packed.n, chunks):
                         self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
                         packed.gus = self.gus
+        late_attn = 0  # bytes of an AttnStream ring the check below took
+        if packed.gus is not None and packed.attns is None and self.attns is not None:
+            # A long step: the check above (the plan's prediction) left AttnStream out, but a
+            # step with no layer keeping [gate | up] on the GPU peaks lower than that predicts
+            # (_held_peak): its attention tensors go to host memory too, beside either ring.
+            attn = self.attns.ring_bytes(packed.n, self.layers[0], packed.rows, packed.max_len)
+            if self._held_fits(packed.n, attn):
+                self.attns.begin(packed.n, self.layers[0], packed.rows, packed.max_len)
+                packed.attns = self.attns
+                late_attn = attn
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = L - k_gu
         packed.keep_all_from = L - k_all
         packed.mlp_chunk = self.mlp_chunk
-        packed.lean = k_gu == 0 and self.lean(packed.n)
+        # (a late AttnStream ring is left out of the lean check: it was taken by _held_peak)
+        packed.lean = k_gu == 0 and self.lean(packed.n, -late_attn)
         if packed.gus is not None:
             packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
         if packed.attns is not None:
-            packed.attns.upto = packed.gus.upto
+            # every layer's attention tensors, those keeping [gate | up] on the GPU included:
+            # their backward then recomputes nothing but the two RMSNorms either (the ring and
+            # every layer's logsumexp are counted already; its last SLOTS layers never leave it)
+            packed.attns.upto = 0 if packed.lean else L
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)
