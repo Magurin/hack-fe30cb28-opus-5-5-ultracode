@@ -420,6 +420,58 @@ def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, l
     assert sorted(loaded) == sorted(list(range(layers - k_gu)) * len(batches))
 
 
+@pytest.mark.parametrize("case", ["chunks", "lean", "border"])
+def test_attention_ring_only_beside_whole_gate_up_ring(tmp_path, monkeypatch, case):
+    """AttnStream is taken only beside a ring of whole [gate | up] outputs: not on a step whose
+    [gate | up] goes to host memory in chunks, not on a lean step, and not when the GuStream
+    ring fits under the cap but both rings do not (the border, where the ring was once counted
+    twice); its ring is then never left allocated, nothing is loaded from it, and loss and
+    gradients are bit for bit those without it."""
+    from solution.engine import FusedQwen2, GuStream
+    from solution.patch import _embedding_to_fp16
+
+    model = _tiny_model(tmp_path, dropout=0.1, layers=3)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    ids, mask, labels = _batch(6, [17, 60, 33, 5])
+    params = [p for p in model.parameters() if p.requires_grad]
+    monkeypatch.setattr(FusedQwen2, "layers_to_keep", lambda self, n: 0)
+
+    def run(attn_on_host):
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
+        engine.offload_weights()
+        engine.offload_head()
+        engine.offload_inputs()
+        engine.offload_gus()
+        engine.mlp_chunk = 32
+        n = int(mask.sum())
+        ring = GuStream.SLOTS * n * 2 * engine.layers[0].I * 2
+        chunks = GuStream.SLOTS * 32 * 2 * engine.layers[0].I * 2
+        limit = {"chunks": chunks, "lean": -1, "border": ring}[case]
+        monkeypatch.setattr(FusedQwen2, "lean", lambda self, n, extra=0: extra > limit)
+        if attn_on_host:
+            engine.offload_attns()
+            monkeypatch.setattr(engine.attns, "load_attn", lambda i, spec: pytest.fail("loaded"))
+        loss, packed, _ = engine.step(ids, mask, labels, 80.0)
+        assert packed.attns is None
+        assert not attn_on_host or engine.attns.ring is None
+        if case == "chunks":
+            assert packed.gus.chunk == 32 and not packed.lean
+        elif case == "lean":
+            assert packed.gus is None and packed.lean
+        else:
+            assert packed.gus.chunk is None and packed.gus.upto == 3
+        grads = torch.autograd.grad(loss, params)
+        engine.restore_weights()
+        return loss, grads
+
+    loss_a, grads_a = run(False)
+    loss_b, grads_b = run(True)
+    assert torch.equal(loss_a, loss_b)
+    assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
 def test_cuda_stack_limit_leaves_the_kernels_alone():
     """With the CUDA thread stack set to 16 bytes (patch.CUDA_STACK_BYTES) the limit holds and
     cuBLAS, attention and our kernels give the same results as with CUDA's default."""

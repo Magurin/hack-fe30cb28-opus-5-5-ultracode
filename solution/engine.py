@@ -564,6 +564,7 @@ class AttnStream(_HostRing):
     def __init__(self, layers, device):
         super().__init__(layers, device)
         self.small = [None] * layers  # per layer: (lse, seed, offset) on the GPU
+        self.extra = 0  # their bytes in this step (lse_bytes), while the ring is allocated
         self.registered = None  # `host`, if pinned in place (unregistered before it is freed)
 
     def unregister(self):
@@ -585,13 +586,19 @@ class AttnStream(_HostRing):
     def cols(self, spec):
         return 2 * spec.HQ * spec.D + 2 * spec.HKV * spec.D + spec.H
 
-    def ring_bytes(self, n, spec):
-        return self.SLOTS * n * self.cols(spec) * 2
+    def lse_bytes(self, spec, rows, max_len):
+        """The logsumexp of every layer, kept on the GPU from its forward to its backward
+        (fp32 [rows, HQ, max_len rounded up to 32]): not allocated when the plan is made."""
+        return self.L * rows * spec.HQ * _cdiv(max_len, 32) * 32 * 4
 
-    def begin(self, n, spec):
+    def ring_bytes(self, n, spec, rows, max_len):
+        return self.SLOTS * n * self.cols(spec) * 2 + self.lse_bytes(spec, rows, max_len)
+
+    def begin(self, n, spec, rows, max_len):
         cols = self.cols(spec)
         self._host(n, cols)
         self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
+        self.extra = self.lse_bytes(spec, rows, max_len)  # counted by FusedQwen2._predicted_peak
         self.n = n
         self.upto = 0
         self.in_slot = [None] * self.SLOTS
@@ -599,6 +606,7 @@ class AttnStream(_HostRing):
 
     def release(self):
         self.ring = None
+        self.extra = 0
         self.small = [None] * self.L
 
     def holds(self, i):
@@ -1610,7 +1618,9 @@ class FusedQwen2:
         # the layer inputs, unless they wait in host memory (their InputStream ring is allocated
         # by then: step() begins it before the plan)
         inputs = 0 if self.inputs is not None else n * L * H * 4
-        return torch.cuda.memory_allocated(self.device) + work + inputs
+        # the logsumexp AttnStream keeps per layer (its ring is allocated by then)
+        lse = self.attns.extra if self.attns is not None and self.attns.ring is not None else 0
+        return torch.cuda.memory_allocated(self.device) + work + inputs + lse
 
     def lean(self, n, extra=0):
         """Whether a step of n tokens needs the lean recomputation to stay under the cap (with
@@ -1777,19 +1787,23 @@ class FusedQwen2:
                 # 2048 tokens) made a T4 instance's 4 x 512-token run 10 s slower.
                 chunks = self.gus.chunk_ring_bytes(self.mlp_chunk, cols)
                 ring = self.gus.ring_bytes(packed.n, cols)
-                attn = (self.attns.ring_bytes(packed.n, self.layers[0])
-                        if self.attns is not None else None)
-                if attn is not None and not self.lean(packed.n, ring + attn):
+                if self.attns is not None and not self.lean(
+                        packed.n, ring + self.attns.ring_bytes(packed.n, self.layers[0],
+                                                               packed.rows, packed.max_len)):
                     # and the attention tensors of the same layers, if the step with both rings
-                    # still needs no lean recomputation
-                    self.attns.begin(packed.n, self.layers[0])
+                    # still needs no lean recomputation (from here on the plan counts its ring
+                    # as allocated and its logsumexp in _predicted_peak)
+                    self.attns.begin(packed.n, self.layers[0], packed.rows, packed.max_len)
                     packed.attns = self.attns
-                if not self.lean(packed.n, ring + (attn if packed.attns is not None else 0)):
+                if not self.lean(packed.n, ring):
                     self.gus.begin(packed.n, cols)
                     packed.gus = self.gus
                 elif not self.lean(packed.n, chunks):
                     self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
                     packed.gus = self.gus
+        if packed.attns is not None and (packed.gus is None or packed.gus.chunk):
+            self.attns.release()  # only beside a ring of whole [gate | up] outputs
+            packed.attns = None
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = L - k_gu
         packed.keep_all_from = L - k_all
@@ -1798,8 +1812,7 @@ class FusedQwen2:
         if packed.gus is not None:
             packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
         if packed.attns is not None:
-            packed.attns.upto = packed.gus.upto if packed.gus is not None \
-                and not packed.gus.chunk else 0
+            packed.attns.upto = packed.gus.upto
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)
