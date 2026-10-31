@@ -478,9 +478,7 @@ def patch_weight_conversion():
             for i in range(0, src.numel(), CONVERT_CHUNK):
                 dst[i:i + CONVERT_CHUNK].copy_(src[i:i + CONVERT_CHUNK].to(device))
             return out
-        if dtype is not None or device is not None:
-            tensor = tensor.to(device=device, dtype=dtype)
-        return tensor
+        return original(tensor, device, dtype)  # tensor[...] of a tensor is the tensor itself
 
     _materialize_copy._soup_kernels_patched = True
     core_model_loading._materialize_copy = _materialize_copy
