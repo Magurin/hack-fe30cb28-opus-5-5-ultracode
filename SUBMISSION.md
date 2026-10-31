@@ -18,7 +18,7 @@ backward тоже ждут на хосте (последние - вместо п
   (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
   Save & Run All; ноутбук и репозиторий открыты для жюри)
 - Demo video (up to 3 minutes): TODO (заполняет команда)
-- Presentation: TODO (заполняет команда)
+- Presentation (PDF, 10 slides): https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/blob/main/presentation/slides.pdf
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
