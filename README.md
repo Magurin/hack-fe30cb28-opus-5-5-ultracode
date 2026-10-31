@@ -14,7 +14,8 @@
 
 **Kaggle T4 · Soup 0.77.0 · Qwen2.5-1.5B-Instruct в NF4 · LoRA r=16 на q/v · batch 4 · 64 шага · fp16**
 
-[Kaggle-ноутбук](https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode) ·
+[замер на Kaggle (версия 24)](https://www.kaggle.com/code/magurin/soup-kernel-run) ·
+[Kaggle-ноутбук сдачи](https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode) ·
 [финальный код `bfff00c`](https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c) ·
 [презентация](presentation/slides.pdf) ·
 [SUBMISSION](SUBMISSION.md)
@@ -58,7 +59,7 @@
 - Kaggle-ноутбук (шаблонный `templates/kaggle_notebook.ipynb`, сохранённая версия с выводом):
   https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
 - Репозиторий: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode, код замера -
-  `bfff00c` (`solution_sha256` `9efa8ec1`, версия 24 ноутбука `magurin/soup-kernel-run`); это и есть
+  `bfff00c` (`solution_sha256` `9efa8ec1`, версия 24 публичного ноутбука замера [`magurin/soup-kernel-run`](https://www.kaggle.com/code/magurin/soup-kernel-run)); это и есть
   финальный код, в `main` код тот же. Поздний прогрев с загрузкой NF4 сразу в pinned-буфер проверен
   после замера (Kaggle A/B: вне цикла -0,3..-0,85 с), но в финал не вошёл - см. «Гипотезы и эксперименты»
 

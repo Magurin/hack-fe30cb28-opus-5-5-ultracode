@@ -13,6 +13,7 @@ backward тоже ждут на хосте (последние - вместо п
   (`solution_sha256` `9efa8ec1`); `main` has the same code. The late warm-up with NF4 loaded straight
   into pinned memory (-0.3..-0.85 s out of the loop in Kaggle A/Bs) was tested after the measurement
   and is not in the final code (no official measurement in time)
+- Public Kaggle notebook of the official measurement (version 24, `bfff00c`: 1.815x / 30.98x, all 10 checks): https://www.kaggle.com/code/magurin/soup-kernel-run
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
   (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
