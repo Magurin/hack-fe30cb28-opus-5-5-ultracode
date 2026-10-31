@@ -390,6 +390,7 @@ nvidia-smi базы на T4 - 14 345 MiB, из них 13 373 MiB - тензор�
 | + потолок шага 420 MiB allocated вместо расчётного 591 (больше пересчёта `[gate \| up]`) | **635** nvidia-smi (хвост до 1 954 токенов: 615, стресс 4 x 512: 613) | Brev T4 |
 | + `[gate \| up]` на хосте вместо пересчёта, кольцо из 2 слотов на GPU (`869380e`) - ради скорости, не памяти | 617-639 на 5 срезах (публичные: 639), хвост 619, стресс 613-617 | Brev T4 |
 | + стек потоков CUDA 16 байт вместо 1 KiB на поток (`aafb9a7`): контекст CUDA больше не держит под него 40 MiB | публичные 597-599 (m 23,95), хвост 579-599, стресс 4 x 512 573; 10/10, время то же (A/B 2 x 2); на Kaggle **601** | Brev T4, Kaggle |
+| + рабочая область cuBLAS `:16:8` вместо 4 MiB x 2 + 16 KiB x 8 на handle (`c4b156e`, `CUBLAS_WORKSPACE_CONFIG` в `apply()`); часть GEMM cuBLAS считает другими алгоритмами, последние биты отличаются, кривая loss 0,007% / 0,01% / max 0,059% | публичные 579-581 на Brev, на Kaggle (A/B) 581-583 вместо 601; время в шуме | Brev T4, Kaggle |
 
 Итог (Kaggle, `5f9b2ef`): allocated 419 MiB, reserved 468 MiB, nvidia-smi **601 MiB** (Brev
 597-599). Из чего состоят 599 MiB nvidia-smi на Brev: 468 - резерв
@@ -589,6 +590,8 @@ nvidia-smi базы на T4 - 14 345 MiB, из них 13 373 MiB - тензор�
 
 `solution.apply()` ставит патчи:
 
+- первым делом - рабочая область cuBLAS `:16:8` через `CUBLAS_WORKSPACE_CONFIG`, если пользователь
+  её не задал (до первого вызова cuBLAS в процессе);
 - `SFTTrainerWrapper.setup` - запуск фоновой компиляции, если она ещё не идёт;
 - загрузка модели в transformers (`offload.py`, `hostload.py`) - эмбеддинг / `lm_head` сразу в
   память CPU, NF4-веса на хост сразу после квантования; только для Qwen2, которую bitsandbytes
@@ -723,6 +726,7 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | NF4-веса слоёв в pinned-памяти CPU с подкачкой на GPU, на хост - сразу после квантования при загрузке | прямо этот вопрос: держать замороженные веса (NF4-слои и fp16 эмбеддинг / `lm_head`) в pinned-памяти CPU и своим кодом подгружать их на GPU по ходу шага ([t.me/souptasterschat/1813](https://t.me/souptasterschat/1813)) - "можно как собственный offloading" ([t.me/souptasterschat/2519](https://t.me/souptasterschat/2519)); не резервировать память в `caching_allocator_warmup` при загрузке - разрешено ([t.me/souptasterschat/2875](https://t.me/souptasterschat/2875), ответ [t.me/souptasterschat/2880](https://t.me/souptasterschat/2880), п. 1); дополнительно: перенос `Params4bit.data` на CPU после сборки модели - "да" ([t.me/souptasterschat/1535](https://t.me/souptasterschat/1535)), у нас те же байты уходят раньше, при загрузке; отдельные CUDA streams для подкачки - "да" ([t.me/souptasterschat/2103](https://t.me/souptasterschat/2103), п. 2); квантование - тот же код bitsandbytes, байты те же, меняется только место хранения ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)) |
 | Эмбеддинг / `lm_head` весь прогон в pinned-памяти CPU, голова стримится на GPU кусками каждый шаг | прямо этот случай: замороженные `embed_tokens` / `lm_head` в pinned-памяти на весь прогон с подкачкой головы кусками - "собственный CPU offloading", время копий входит в замер ([t.me/souptasterschat/834](https://t.me/souptasterschat/834), п. 2; [t.me/souptasterschat/2519](https://t.me/souptasterschat/2519)); вычисления в fp16, как у базы под autocast ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)); закрепление памяти на месте через `cudaHostRegister` - тот же pinned-вес, а не настройка аллокатора |
 | Стек потоков CUDA 16 байт (`cudaDeviceSetLimit(cudaLimitStackSize, 16)` при установке шага) | прямо этот вопрос в чате ([t.me/souptasterschat/2037](https://t.me/souptasterschat/2037)) - "да" ([t.me/souptasterschat/2039](https://t.me/souptasterschat/2039), п. 2). Это резерв стека потоков контекста CUDA, а не аллокатор PyTorch и не гиперпараметр; драйвер сам поднимает лимит ядру, которому нужно больше, значения те же (тест) |
+| Рабочая область cuBLAS `:16:8` (`CUBLAS_WORKSPACE_CONFIG`, если пользователь его не задал, и `CUBLASLT_WORKSPACE_SIZE` 128 KiB) первым делом в `apply()` | прямо этот вопрос - уменьшить рабочую область cuBLAS в `apply()` ([t.me/souptasterschat/2875](https://t.me/souptasterschat/2875), п. 4) - разрешено ([t.me/souptasterschat/2880](https://t.me/souptasterschat/2880): "кроме 8го все можно"). Это не аллокатор PyTorch: память области берёт сам cuBLAS; GEMM те же, отличаются только выбранные алгоритмы и последние биты |
 | Эмбеддинг / `lm_head` хранятся только в fp16 | панель 58:22-58:38; [t.me/souptasterschat/620](https://t.me/souptasterschat/620): можно, если меняется только хранение, а значения и dtype в вычислениях те же - у нас значения побитно те же |
 | Патч загрузчика transformers (куда класть веса при загрузке, без предварительного резервирования GPU-памяти) | патчи transformers в `apply()` - панель 43:04 ("через apply можно подменять код модели и операции"); пропустить `caching_allocator_warmup` - разрешено ([t.me/souptasterschat/2880](https://t.me/souptasterschat/2880), п. 1); значения весов и вся остальная загрузка те же, `hf_device_map` и dispatch модели не меняются; встроенный в Soup `activation_offloading` и другие его режимы не используются |
 | Маска LoRA dropout | бит в бит как у базы: тот же поток Philox от того же состояния генератора CUDA, в том же порядке вызовов. Свой генератор для маски внутри кернела организаторы запретили ([t.me/souptasterschat/2596](https://t.me/souptasterschat/2596), ответы [t.me/souptasterschat/2632](https://t.me/souptasterschat/2632) п. 2 и [t.me/souptasterschat/2637](https://t.me/souptasterschat/2637)) |
@@ -842,6 +846,7 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | `OFFLOAD_WEIGHTS` | `True` | подкачка NF4-весов из pinned-памяти CPU в шаге; `False` - веса на GPU, только вместе с `HOST_NF4_AT_LOAD = False` (до выгрузок при загрузке пик был 1 761 MiB против 1 385, цикл тот же) |
 | `OFFLOAD_ACTIVATIONS` | `True` | входы слоёв для backward в pinned-памяти CPU (`InputStream`); `False` - на GPU (loss и градиенты побитно те же, пик выше) |
 | `OFFLOAD_GU` | `True` | выходы `[gate \| up]` в pinned-памяти CPU вместо пересчёта в backward (`GuStream`); `False` - пересчёт (loss и градиенты побитно те же на шагах с кольцом целых выходов; на Kaggle медленнее на ~2 с, на машине с медленной шиной, как Brev, быстрее на ~5 с) |
+| `CUBLAS_WORKSPACE` (`solution/startup.py`) | `":16:8"` | рабочая область cuBLAS на handle, если `CUBLAS_WORKSPACE_CONFIG` не задан пользователем; `None` - значение PyTorch по умолчанию (4 MiB x 2 + 16 KiB x 8) |
 | `CUDA_STACK_BYTES` | 16 | стек потоков CUDA в байтах на поток (`cudaDeviceSetLimit`): резерв контекста 40 MiB -> <1 MiB; `None` - значение CUDA по умолчанию (1 KiB) |
 | `STEP_CAP_MIB` | 420 | потолок памяти шага (MiB allocated), под которым шаг хранит активации вместо пересчёта; `None` - расчётный от пика загрузки (591 на T4) |
 | `KEEP_MARGIN` | 112 MiB | только при `STEP_CAP_MIB = None`: запас под расчётным потолком на фрагментацию аллокатора и модули CUDA, которые подгружаются во время обучения (с 64 MiB пик T4 выходил на 36 MiB выше) |
@@ -971,6 +976,8 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | Отключить `synchronous=FULL` в SQLite-трекере Soup (2,3-2,5 мс на commit, ~0,17 с на прогон) | меняет долговечность базы Soup - не трогаем |
 | Не импортировать и другие необязательные пакеты (разрешено без заглушек в `sys.modules`: [t.me/souptasterschat/2507](https://t.me/souptasterschat/2507), п. 3) | `python -X importtime` прогона решения: после `apply()` scipy, torchvision, tensorboard, matplotlib уже никто не импортирует, sklearn и wandb мы пропускаем. Тяжёлые оставшиеся импорты обязательны: pandas 0,30 с (его без проверки доступности импортирует `datasets.arrow_dataset`), sympy 0,24 с (через `torch._dynamo`, нужный `transformers.masking_utils`), aiohttp + requests 0,14 с (`datasets.utils.file_utils`); убрать их можно только заглушкой в `sys.modules`, а это запрещено |
 | Входы слоёв хранить в fp16 вместо fp32 (тензор только для backward в fp16 разрешён: [t.me/souptasterschat/2507](https://t.me/souptasterschat/2507), п. 2) | кольцо входов на GPU - 25-36 MiB, в fp16 пик меньше лишь на ~12 MiB и только при потолке шага 408 вместо 420; скорости не даёт (шина на Kaggle не узкое место), а пересчёт в backward пошёл бы от иначе округлённого входа - риск для проверок 6-7 |
+| Запоминать рендер шаблона чата Soup по тексту диалога и заранее создавать handle cuBLAS (ветка `s1-prep`) | на Kaggle +30 с вне цикла (причину ищем), на Brev +0,12 с - не взяли |
+| Состояния AdamW для LoRA держать в pinned-памяти CPU | пик малого пула аллокатора не снижается - не взяли |
 | Не компилировать в прогреве `lm_head_ce_kernel` (он нужен только запасному пути) | Brev, 6 против 6: вне цикла 15,05 против 15,20 с, вся команда 42,10 против 42,16 с - шум |
 
 ## Ограничения и что не получилось
@@ -995,8 +1002,8 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 - **Дальше ~600 MiB пик опускается плохо.** ~120-130 MiB - вне аллокатора PyTorch: контекст CUDA (62,
   уже со стеком 16 байт) и код загруженных кернелов (~58). Остальные лимиты контекста (буфер
   printf, куча `malloc` на устройстве и др.) резервируются лениво - их уменьшение даёт 0; выгрузить
-  модули нельзя - кернелы нужны шагу; workspace cuBLAS лежит внутри резерва PyTorch и задаётся
-  только `CUBLAS_WORKSPACE_CONFIG` - это настройка, её не трогаем. Ещё ~150 MiB - слоты весов слоя
+  модули нельзя - кернелы нужны шагу; рабочую область cuBLAS мы уже уменьшили до `:16:8` (`c4b156e`,
+  -20 MiB). Ещё ~150 MiB - слоты весов слоя
   и буферы кусков головы, остальное - кольца и активации шага под потолком 420 MiB allocated. Потолок 340 давал 555 MiB (до
   `[gate | up]` на хосте), но цикл дороже на 0,5 с, а ниже 555 экономный шаг не опускается.
 - **Выгрузки зависят от шины.** Каждый шаг гоняет по PCIe голову (445 MiB), входы слоёв (~135 MiB в
@@ -1034,7 +1041,7 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | `solution/hostload.py` | NF4-веса на хост сразу после квантования при загрузке модели |
 | `solution/offload.py` | эмбеддинг / `lm_head` в память CPU при загрузке модели |
 | `solution/patch.py` | подключение к Soup, бухгалтерия метрик, откат, `patch_prepare_kbit` (эмбеддинг в fp16), патч `packages_distributions`, `patch_weight_conversion`, `set_cuda_stack`, обходы модели на границе шага |
-| `solution/startup.py` | патчи импорта: bitsandbytes без TorchInductor, без sklearn / wandb |
+| `solution/startup.py` | рабочая область cuBLAS `:16:8`; патчи импорта: bitsandbytes без TorchInductor, без sklearn / wandb |
 | `solution/warmup.py` | фоновая компиляция кернелов (один поток, nice 19, лаунчеры с -O0), заранее закреплённые блоки и заведение страниц буфера `[gate \| up]` |
 | `solution/test_*.py` | тесты корректности, отката и обеих выгрузок |
 | `dev/mask_probe/` | отладочный зонд: маски dropout решения против масок базы на настоящей модели |
