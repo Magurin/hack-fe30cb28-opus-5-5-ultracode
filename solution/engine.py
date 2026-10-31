@@ -1033,7 +1033,9 @@ class _Layer(torch.autograd.Function):
 # Final norm + lm_head + cross-entropy + metrics, chunked
 # ---------------------------------------------------------------------------------------------
 class HeadStats:
-    pass
+    """What the head hands back for the logged metrics (row order, per-token loss, entropy,
+    correct). The head also passes one to _rms_fwd / _rms_bwd as the layer spec, of which they
+    read only `eps`."""
 
 
 class _Head(torch.autograd.Function):
@@ -1124,8 +1126,8 @@ class HostHead:
         n = ids_cpu.numel()
         if self.rows is None or self.rows.shape[0] < n:
             self.rows_copied.synchronize()
-            self.rows = torch.empty((max(n, 2048), self.H), dtype=self.host.dtype,
-                                    pin_memory=True)
+            self.rows = torch.empty((max(n, _HostRing.HOST_ROWS), self.H),
+                                    dtype=self.host.dtype, pin_memory=True)
         self.rows_copied.synchronize()  # the previous step's copy has read the staging buffer
         rows = self.rows[:n]
         torch.index_select(self.host, 0, ids_cpu, out=rows)
@@ -1374,8 +1376,9 @@ class FusedQwen2:
                 spec.stream = self.stream
 
     def offload_head(self):
-        """Keep the tied embedding / lm_head weight in pinned host memory (HostHead). Only an fp16
-        weight (the one the head's GEMM reads): returns whether it is offloaded."""
+        """Keep the tied embedding / lm_head weight in pinned host memory (HostHead): pinned where
+        the loader left it (solution/offload) or copied into a pinned buffer. Only an fp16 weight
+        (the one the head's GEMM reads): returns whether it is offloaded."""
         if self.head is not None:
             return True
         weight = self.embed
@@ -1383,11 +1386,11 @@ class FusedQwen2:
             return False
         if _pin_in_place(weight.data, self.device):  # where the loader put it (solution/offload)
             self.registered = weight.data
-        elif not weight.data.is_pinned():
+        elif not weight.data.is_pinned():  # on the GPU (or not pinnable in place): copied over
             host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
             host.copy_(weight.data)
             weight.data = host
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # the GPU copy goes back to the driver
         self.head = HostHead(weight, self.device)
         return True
 

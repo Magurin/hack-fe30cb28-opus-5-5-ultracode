@@ -1,5 +1,7 @@
-"""The embedding / lm_head weight in pinned host memory (engine.HostHead): the streamed head
-against the head with the weight on the GPU, and the whole step with both offloads.
+"""What waits in pinned host memory: the embedding / lm_head weight (engine.HostHead; the
+streamed head and its CE kernels against the head with the weight on the GPU, the whole step
+with the layer weights streamed too), and the layer inputs (InputStream) and [gate | up]
+outputs (GuStream), bit for bit against keeping them on the GPU.
 
 Run on a GPU: `python -m pytest solution -q`.
 """
