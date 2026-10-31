@@ -22,20 +22,20 @@ backward тоже ждут на хосте (последние - вместо п
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
-`c4b156e`, публичные строки, меньший из двух запусков `--repeats 2` (у кода `5f9b2ef` на Brev T4 -
+`8c584c0`, публичные строки, меньший из двух запусков `--repeats 2` (у кода `5f9b2ef` на Brev T4 -
 13,9-15,0%: другие процессор и шина).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 9,4% |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add перед MLP, касты в fp16, dropout входов LoRA (маска бит в бит как у базы) | 2,6% |
-| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA (те же маски), суммы градиентов | 1,4% |
+| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 9,5% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add перед MLP, касты в fp16, dropout входов LoRA (маска бит в бит как у базы) | 2,7% |
+| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA (те же маски), суммы градиентов | 1,5% |
 | `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 1,25% |
-| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,44% |
-| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,5 + 2,6% |
-| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,65 + 0,01% |
+| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,45% |
+| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,5 + 2,7% |
+| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,70 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **19,9%** (порог 5%) |
+| **Всего** | | | **20,2%** (порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -52,14 +52,14 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 79,4 | 46,5 | 1,710x speedup |
-| Training loop, 64 steps, s | 55,0 | 24,2 | 2,27x |
+| Time of `soup train`, s (mean of 2 runs) | 79,4 | 43,5 | 1,824x speedup |
+| Training loop, 64 steps, s | 55,3 | 24,0 | 2,31x |
 | Peak GPU memory, MiB | 14 345 | 583 | 24,61x base/ours |
-| Eval loss (public rows) | 2,04966 | 2,04960 | -0,003% vs base |
+| Eval loss (public rows) | 2,04967 | 2,04967 | 0,000% vs base |
 
-Код `c4b156e` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,815x / 24,69x -
-завышен холодной базой (83,9 с), опираемся на r2. Наши r2 в разных сессиях начиная с `180c8e4`:
-1,598-1,729x.
+Код `8c584c0` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 2,061x / 24,61x -
+завышен холодной базой (89,2 с), опираемся на r2. Наши r2 в разных сессиях начиная с `180c8e4`:
+1,598-1,824x (до своей токенизации - не выше 1,729x).
 
 - [x] All 10 checks of `harness/check_rules.py` passed: все 10 и в прогоне `--repeats 2`, и в
   шаблонном (проверка 10 - 79 тестов Soup passed)
