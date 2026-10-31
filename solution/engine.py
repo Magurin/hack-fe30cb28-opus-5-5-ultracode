@@ -26,10 +26,11 @@ projection output, (B, T, 151936) logits upcast to fp32), one step goes like thi
 
 The math is the base's: the same fp16 roundings at the same places (projection outputs, attention
 inputs, the MLP product), fp32 for the residual, the norms, RoPE, softmax and the loss. The LoRA
-dropout is regenerated from a seed in backward instead of being stored.
+dropout masks are the base's own, bit for bit: those PEFT's nn.Dropout would draw from the CUDA
+generator, in the same order (`TorchDropout`); our kernels compute them from the generator's seed
+and offset, in backward again instead of storing them.
 """
 
-import random
 import threading
 
 import torch
@@ -587,7 +588,7 @@ class UnsupportedBatch(ValueError):
 class Packed:
     """One micro-batch without its padding: real tokens of every row, back to back."""
 
-    def __init__(self, input_ids, attention_mask, labels, rope, dropout_rng, dropout_p):
+    def __init__(self, input_ids, attention_mask, labels, rope, dropout, dropout_p):
         if input_ids.dim() != 2 or attention_mask.shape != input_ids.shape \
                 or labels.shape != input_ids.shape:
             raise UnsupportedBatch("inputs are not [rows, tokens]")
@@ -599,6 +600,8 @@ class Packed:
             raise UnsupportedBatch("attention_mask is not right-padded")
         flat = expected.reshape(-1).nonzero().squeeze(1)
         self.n = int(flat.numel())
+        self.tok = flat  # each packed token's index in the padded [B, T] batch (int64)
+        self.T = T
         self.rows = B
         self.lengths = [int(x) for x in lengths_cpu]
         self.max_len = max(self.lengths) if self.lengths else 0
@@ -618,7 +621,9 @@ class Packed:
             torch.arange(B, device=input_ids.device), lengths)
         self.cos, self.sin = rope.table(self.max_len)
         self.dropout_p = dropout_p
-        self.rng = dropout_rng
+        self.dropout = dropout  # a TorchDropout (the base's masks), or None without dropout
+        self.drop_seed = self.drop_threads = None  # its seed and threads in this step (draw)
+        self.drop_vec = dropout.vec if dropout is not None else 4
         self.lora16_views = None  # per layer: fp16 copies of its LoRA weights (FusedQwen2.step)
         self.keep_gu_from = 1 << 30  # layers from this index on keep [gate | up] for backward
         self.keep_all_from = 1 << 30  # ... and from this one every intermediate
@@ -632,8 +637,49 @@ class Packed:
             return self.lora16_views[index]
         return tuple(None if t is None else t.to(torch.float16) for t in weights)
 
-    def seed(self):
-        return self.rng.randrange(1, 2**31 - 1)
+    def draw(self, H):
+        """The counter of the next LoRA dropout mask of this step (the base's next nn.Dropout
+        call, on its padded [B, T, H] LoRA input)."""
+        seed, ctr, threads = self.dropout.draw(self.rows * self.T * H)
+        assert self.drop_seed in (None, seed) and self.drop_threads in (None, threads)
+        self.drop_seed, self.drop_threads = seed, threads
+        return ctr
+
+
+class TorchDropout:
+    """The LoRA dropout masks of the base, bit for bit. PEFT's Linear4bit runs
+    lora_B(lora_A(dropout(x))) on the layer's LoRA input x: an nn.Dropout(p) on a contiguous
+    [B, T, H] tensor of `dtype`, which (torch.nn.functional.dropout -> native_dropout ->
+    dropout_cuda in aten/src/ATen/native/cuda/Dropout.cu) takes a Philox state (seed, offset) from
+    the default CUDA generator and advances its offset. `draw` takes the same state for the next
+    call and advances the generator the same way, so every later draw (ours, or the base's own
+    code after a fallback) sees the offset it would see in the base; the kernels compute the
+    mask from it (kernels._torch_dropout_keep). The base calls dropout once per LoRA module, in
+    the order the forward reaches them: layer 0 q_proj, layer 0 v_proj, layer 1 q_proj, ... (its
+    gradient checkpointing, if any, replays under a forked generator state)."""
+
+    BLOCK, UNROLL = 256, 4  # Dropout.cu: block_size, UNROLL
+
+    def __init__(self, device, dtype):
+        props = torch.cuda.get_device_properties(device)
+        self.max_blocks = props.multi_processor_count \
+            * (props.max_threads_per_multi_processor // self.BLOCK)
+        self.gen = torch.cuda.default_generators[device.index if device.index is not None
+                                                  else torch.cuda.current_device()]
+        # the vectorized kernel (a contiguous, 16-byte aligned input with numel % VEC == 0)
+        self.vec = 16 // torch.empty((), dtype=dtype).element_size()
+        assert self.vec in (4, 8), dtype
+
+    def draw(self, nelem):
+        """(seed, counter, threads) of a dropout call on nelem elements; advances the generator."""
+        assert nelem % self.vec == 0, nelem
+        blocks = min(self.max_blocks, (nelem + self.BLOCK - 1) // self.BLOCK)
+        increment = ((nelem - 1) // (self.BLOCK * blocks * self.UNROLL) + 1) * self.UNROLL
+        seed, offset = self.gen.initial_seed(), self.gen.get_offset()
+        self.gen.set_offset(offset + increment)
+        if seed >= 2**63:  # the kernels take it as int64, its bits as they are
+            seed -= 2**64
+        return seed, offset // 4, blocks * self.BLOCK
 
 
 class RopeTable:
@@ -729,13 +775,24 @@ def _lora_scale(spec):
     return scales.pop() if scales else 1.0
 
 
-def _dummy16(device):
+def _dummy16(device, dtype=torch.float16):
     """A small fp16 tensor standing in for an output or input a launch does not use, so
     every launch of a kernel has the same argument types (one compiled variant)."""
-    t = _DUMMIES.get(device)
+    t = _DUMMIES.get((device, dtype))
     if t is None:
-        t = _DUMMIES[device] = torch.empty((8,), device=device, dtype=torch.float16)
+        t = _DUMMIES[device, dtype] = torch.empty((8,), device=device, dtype=dtype)
     return t
+
+
+def _dropout_args(packed, x, seeds):
+    """The rms kernels' dropout arguments: the tokens' indices in the padded batch, the keep
+    probability and scale, the generator's seed, the counters of the q and v masks
+    (TorchDropout.draw), its threads."""
+    tok = getattr(packed, "tok", None)
+    p = packed.dropout_p
+    return (tok if tok is not None else _dummy16(x.device, torch.int64), 1.0 - p,
+            1.0 / (1.0 - p), getattr(packed, "drop_seed", None) or 0, seeds[0], seeds[1],
+            getattr(packed, "drop_threads", None) or 1)
 
 
 _DUMMIES = {}
@@ -750,15 +807,15 @@ def _rms_fwd(spec, x, weight, packed, *, delta=None, write_y=True, seeds=(0, 0),
     yq = torch.empty((n, H), device=dev, dtype=torch.float16) if drop_q else None
     yv = torch.empty((n, H), device=dev, dtype=torch.float16) if drop_v else None
     rstd = torch.empty((n,), device=dev, dtype=torch.float32)
-    p = packed.dropout_p
     dummy = _dummy16(dev)
     if n:
+        tok, p_keep, keep_scale, seed, ctr_q, ctr_v, threads = _dropout_args(packed, x, seeds)
         _launch(K.rms_fwd_kernel, (n,),
             x, delta if delta is not None else dummy, weight, xsum,
             y if y is not None else dummy, yq if yq is not None else dummy,
-            yv if yv is not None else dummy, rstd, H, spec.eps, p, 1.0 / (1.0 - p), seeds[0],
-            seeds[1], int(delta is not None), int(write_y), int(drop_q), int(drop_v),
-            BLOCK=_pow2(H), num_warps=8)
+            yv if yv is not None else dummy, rstd, tok, H, spec.eps, p_keep, keep_scale, seed,
+            ctr_q, ctr_v, threads, int(delta is not None), int(write_y), int(drop_q),
+            int(drop_v), VEC=getattr(packed, "drop_vec", 4), BLOCK=_pow2(H), num_warps=8)
     return xsum, y, yq, yv, rstd
 
 
@@ -766,13 +823,14 @@ def _rms_bwd(spec, dy, x, rstd, weight, packed, *, dres=None, tq=None, tv=None, 
              grad_scale=1.0, out=None):
     n, H = x.shape
     dx = out if out is not None else torch.empty_like(x)
-    p = packed.dropout_p
     if n:
+        tok, p_keep, keep_scale, seed, ctr_q, ctr_v, threads = _dropout_args(packed, x, seeds)
         _launch(K.rms_bwd_kernel, (n,),
             dy, tq if tq is not None else dy, tv if tv is not None else dy, x, rstd, weight,
-            dres if dres is not None else x, dx, H, dy.stride(0), p, 1.0 / (1.0 - p),
-            seeds[0], seeds[1], grad_scale, int(tq is not None), int(tv is not None),
-            int(dres is not None), BLOCK=_pow2(H), num_warps=8)
+            dres if dres is not None else x, dx, tok, H, dy.stride(0), p_keep, keep_scale,
+            seed, ctr_q, ctr_v, threads, grad_scale, int(tq is not None),
+            int(tv is not None), int(dres is not None), VEC=getattr(packed, "drop_vec", 4),
+            BLOCK=_pow2(H), num_warps=8)
     return dx
 
 
@@ -961,8 +1019,10 @@ class _Layer(torch.autograd.Function):
     def forward(ctx, h, spec, packed, aq_w, bq_w, ak_w, bk_w, av_w, bv_w):
         if ak_w is not None:
             raise NotImplementedError("LoRA on k_proj")
-        seeds = (packed.seed() if aq_w is not None else 0,
-                 packed.seed() if av_w is not None else 0)
+        # the base's next two dropout calls: this layer's q_proj, then v_proj
+        drop = packed.dropout is not None
+        seeds = (packed.draw(spec.H) if drop and aq_w is not None else 0,
+                 packed.draw(spec.H) if drop and av_w is not None else 0)
         lora16 = packed.lora16(spec.index, (aq_w, bq_w, av_w, bv_w))
         offloaded = packed.inputs is not None and packed.inputs.save(spec.index, h)
         if spec.stream is not None:
@@ -1316,6 +1376,7 @@ class FusedQwen2:
     """Holds what the step needs from a PEFT-wrapped, 4-bit Qwen2ForCausalLM."""
 
     def __init__(self, peft_model, seed=0):
+        # (seed: unused - the LoRA dropout masks come from the CUDA generator, as the base's)
         causal = peft_model.get_base_model()
         inner = causal.model
         config = causal.config
@@ -1337,7 +1398,9 @@ class FusedQwen2:
         self.embed = inner.embed_tokens.weight
         self.lm_w = causal.lm_head.weight
         self.rope = RopeTable(inner.rotary_emb, self.layers[0].D, self.device)
-        self.rng = random.Random(seed)
+        # the LoRA dropout masks: the base's (TorchDropout), on its LoRA input's dtype
+        self.dropout = TorchDropout(self.device, _lora_input_dtype(inner.layers[0], lora_names)) \
+            if self.dropout_p > 0 else None
         self.mlp_chunk = MLP_CHUNK
         # One fp16 buffer for every LoRA weight: refreshed by a single foreach copy per step
         # instead of four casts per layer in forward and again in backward.
@@ -1529,7 +1592,8 @@ class FusedQwen2:
         InputStream and GuStream rings are allocated before the plan (keep_plan, lean), so the
         plan counts them; the streamed head fetches its first pieces HostHead.PREFETCH_LAYERS
         layers before the end of the forward."""
-        packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, self.dropout_p)
+        packed = Packed(input_ids, attention_mask, labels, self.rope, self.dropout,
+                        self.dropout_p)
         if self.lora_views:
             with torch.no_grad():
                 torch._foreach_copy_(self.lora_views, self.lora_fp32)
@@ -1591,6 +1655,20 @@ def _lora_targets(layer):
         if names:
             found[short] = names[0]
     return found
+
+
+def _lora_input_dtype(layer, lora_names):
+    """The dtype of the tensor PEFT's LoRA dropout runs on: x cast to lora_A's dtype, or under
+    autocast (Soup's fp16 training) x itself, input_layernorm's output weight * x.to(residual
+    dtype) - with prepare_model_for_kbit_training's fp32 norm weights, residual and LoRA weights,
+    fp32 either way."""
+    dtypes = {layer.input_layernorm.weight.dtype}
+    for short, name in lora_names.items():
+        dtypes.add(getattr(layer.self_attn, f"{short}_proj").lora_A[name].weight.dtype)
+    out = dtypes.pop()
+    for d in dtypes:
+        out = torch.promote_types(out, d)
+    return out
 
 
 def _lora_dropout(layer, lora_names):

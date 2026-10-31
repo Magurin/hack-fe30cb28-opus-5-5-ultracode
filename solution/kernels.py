@@ -105,16 +105,47 @@ def nf4_dequant_kernel(packed_ptr, absmax_ptr, code2_ptr, absmax2_ptr, offset_pt
 
 
 # --------------------------------------------------------------------------------------------
+# The keep mask of PyTorch's own CUDA dropout (aten/src/ATen/native/cuda/Dropout.cu, the
+# vectorized fused_dropout_kernel_vec of torch 2.11; PEFT's nn.Dropout on the LoRA input runs
+# it), bit for bit, for element e of the contiguous tensor it drops: thread t = (e // VEC) % G
+# of its G = grid * 256 threads loads VEC elements per iteration i = (e // VEC) // G and draws
+# VEC / 4 curand_uniform4 for them; curand_init(seed, t, offset) makes call j of thread t
+# Philox4x32-10 with key = seed and counter (offset / 4 + j, t) (the offset is a multiple of 4),
+# component e % 4; kept if u * 2^-32 + 2^-33 < 1 - p (fp32). tl.philox is the same Philox4x32-10.
+# --------------------------------------------------------------------------------------------
+@triton.jit
+def _torch_dropout_keep(seed, ctr, e, G, p_keep, VEC: tl.constexpr):
+    g = e // VEC
+    thread = (g % G).to(tl.uint32)
+    c = ctr + (g // G) * (VEC // 4) + (e % VEC) // 4
+    r0, r1, r2, r3 = tl.philox(seed, (c & 0xFFFFFFFF).to(tl.uint32), (c >> 32).to(tl.uint32),
+                               thread, thread * 0)
+    comp = e % 4
+    u = tl.where(comp == 0, r0, tl.where(comp == 1, r1, tl.where(comp == 2, r2, r3)))
+    return u.to(tl.float32) * 2.3283064365386963e-10 + 1.1641532182693481e-10 < p_keep
+
+
+@triton.jit(do_not_specialize=["seed", "ctr", "G"])
+def torch_dropout_keep_kernel(out_ptr, nelem, seed, ctr, G, p_keep, VEC: tl.constexpr,
+                              BLOCK: tl.constexpr):
+    """The keep mask of elements 0..nelem of one dropout call (for the tests)."""
+    e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    keep = _torch_dropout_keep(seed, ctr, e, G, p_keep, VEC)
+    tl.store(out_ptr + e, keep.to(tl.int8), mask=e < nelem)
+
+
+# --------------------------------------------------------------------------------------------
 # RMSNorm over rows of H fp32 values. Optionally first adds a fp16 delta to the fp32 residual
 # (and writes the sum), optionally also writes dropout(y) for up to two LoRA inputs. The dropout
-# mask is a pure function of (seed, row * H + col), so the backward regenerates it instead of
-# storing it.
+# masks are the base's own (_torch_dropout_keep): a pure function of (seed, the call's counter,
+# the token's index in the padded [B, T, H] batch the base drops), so the backward regenerates
+# them instead of storing them.
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["seed_q", "seed_v", "has_delta", "write_y", "drop_q",
+@triton.jit(do_not_specialize=["seed", "ctr_q", "ctr_v", "G", "has_delta", "write_y", "drop_q",
                                 "drop_v"])
-def rms_fwd_kernel(x_ptr, delta_ptr, w_ptr, xsum_ptr, y_ptr, yq_ptr, yv_ptr, rstd_ptr,
-                   H, eps, p_drop, keep_scale, seed_q, seed_v, has_delta, write_y, drop_q,
-                   drop_v, BLOCK: tl.constexpr):
+def rms_fwd_kernel(x_ptr, delta_ptr, w_ptr, xsum_ptr, y_ptr, yq_ptr, yv_ptr, rstd_ptr, tok_ptr,
+                   H, eps, p_keep, keep_scale, seed, ctr_q, ctr_v, G, has_delta, write_y, drop_q,
+                   drop_v, VEC: tl.constexpr, BLOCK: tl.constexpr):
     """The options are runtime flags, not constexprs: one compiled variant serves the input
     norm, the post-attention norm and the final norm (compilation is part of the measured
     time; the branches are uniform across the grid and cost nothing measurable)."""
@@ -131,21 +162,22 @@ def rms_fwd_kernel(x_ptr, delta_ptr, w_ptr, xsum_ptr, y_ptr, yq_ptr, yv_ptr, rst
     y = tl.load(w_ptr + cols, mask=inside, other=0.0) * (x * rstd)
     if write_y != 0:
         tl.store(y_ptr + base + cols, y.to(tl.float16), mask=inside)
-    rand_offs = (row * H + cols).to(tl.int32)
+    # the elements of the padded batch (tok_ptr: the token's index in it; a dummy without dropout)
+    e = tl.load(tok_ptr + row, mask=drop_q + drop_v != 0, other=0) * H + cols
     if drop_q != 0:
-        keep = tl.rand(seed_q, rand_offs) >= p_drop
+        keep = _torch_dropout_keep(seed, ctr_q, e, G, p_keep, VEC)
         tl.store(yq_ptr + base + cols, tl.where(keep, y * keep_scale, 0.0).to(tl.float16),
                  mask=inside)
     if drop_v != 0:
-        keep = tl.rand(seed_v, rand_offs) >= p_drop
+        keep = _torch_dropout_keep(seed, ctr_v, e, G, p_keep, VEC)
         tl.store(yv_ptr + base + cols, tl.where(keep, y * keep_scale, 0.0).to(tl.float16),
                  mask=inside)
 
 
-@triton.jit(do_not_specialize=["seed_q", "seed_v", "drop_q", "drop_v", "has_res"])
-def rms_bwd_kernel(dy_ptr, tq_ptr, tv_ptr, x_ptr, rstd_ptr, w_ptr, dres_ptr, dx_ptr,
-                   H, dy_stride, p_drop, keep_scale, seed_q, seed_v, grad_scale,
-                   drop_q, drop_v, has_res, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["seed", "ctr_q", "ctr_v", "G", "drop_q", "drop_v", "has_res"])
+def rms_bwd_kernel(dy_ptr, tq_ptr, tv_ptr, x_ptr, rstd_ptr, w_ptr, dres_ptr, dx_ptr, tok_ptr,
+                   H, dy_stride, p_keep, keep_scale, seed, ctr_q, ctr_v, G, grad_scale,
+                   drop_q, drop_v, has_res, VEC: tl.constexpr, BLOCK: tl.constexpr):
     """dx = dres + RMSNorm'(x)^T (dy + mask_q * tq / (1-p) + mask_v * tv / (1-p)) * grad_scale."""
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -153,13 +185,13 @@ def rms_bwd_kernel(dy_ptr, tq_ptr, tv_ptr, x_ptr, rstd_ptr, w_ptr, dres_ptr, dx_
     base = row.to(tl.int64) * H
     dy = tl.load(dy_ptr + row.to(tl.int64) * dy_stride + cols, mask=inside, other=0.0)
     dy = dy.to(tl.float32)
-    rand_offs = (row * H + cols).to(tl.int32)
+    e = tl.load(tok_ptr + row, mask=drop_q + drop_v != 0, other=0) * H + cols
     if drop_q != 0:
-        keep = tl.rand(seed_q, rand_offs) >= p_drop
+        keep = _torch_dropout_keep(seed, ctr_q, e, G, p_keep, VEC)
         tq = tl.load(tq_ptr + base + cols, mask=inside, other=0.0).to(tl.float32)
         dy += tl.where(keep, tq * keep_scale, 0.0)
     if drop_v != 0:
-        keep = tl.rand(seed_v, rand_offs) >= p_drop
+        keep = _torch_dropout_keep(seed, ctr_v, e, G, p_keep, VEC)
         tv = tl.load(tv_ptr + base + cols, mask=inside, other=0.0).to(tl.float32)
         dy += tl.where(keep, tv * keep_scale, 0.0)
     x = tl.load(x_ptr + base + cols, mask=inside, other=0.0)

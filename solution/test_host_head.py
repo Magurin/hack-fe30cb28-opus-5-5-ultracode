@@ -212,7 +212,8 @@ def test_host_head_step(tmp_path):
     ref = torch.autograd.grad(out.loss.float(), params)
 
     def run(offload):
-        engine = FusedQwen2(model, seed=7)
+        torch.cuda.manual_seed(7)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         if offload:
             engine.offload_weights()
             assert engine.offload_head()
@@ -300,7 +301,8 @@ def test_layer_inputs_in_host_memory_are_exact(tmp_path, monkeypatch, slots, cap
     params = [p for p in model.parameters() if p.requires_grad]
 
     def run(inputs_on_host):
-        engine = FusedQwen2(model, seed=11)
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         engine.offload_weights()
         engine.offload_head()
         if inputs_on_host:
@@ -341,7 +343,8 @@ def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, lay
     params = [p for p in model.parameters() if p.requires_grad]
 
     def run(gu_on_host):
-        engine = FusedQwen2(model, seed=11)
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         engine.offload_weights()
         engine.offload_head()
         engine.offload_inputs()
@@ -424,7 +427,8 @@ def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
         monkeypatch.setattr(FusedQwen2, "lean",
                             (lambda self, n, extra=0: extra > 2 * 32 * 2 * 640 * 2) if gu_on_host
                             else (lambda self, n, extra=0: True))
-        engine = FusedQwen2(model, seed=11)
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         engine.offload_weights()
         engine.offload_head()
         engine.offload_inputs()

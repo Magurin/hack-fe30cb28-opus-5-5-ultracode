@@ -55,7 +55,8 @@ def test_host_load_same_step(tmp_path):
         g = torch.Generator().manual_seed(1)
         for p in params:
             p.data = (torch.randn(p.shape, generator=g) * 0.02).to(p.device, p.dtype)
-        engine = FusedQwen2(model, seed=2)
+        torch.cuda.manual_seed(2)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         assert engine.weights_on_host() == host
         engine.offload_weights()
         loss, _, _ = engine.step(ids, mask, labels, 60.0)

@@ -49,6 +49,47 @@ class _Packed:
         self.dropout_p = p
 
 
+def _torch_keep(nelem, seed, ctr, threads, p, vec):
+    """Our kernel's keep mask of one dropout call (kernels._torch_dropout_keep), elements
+    0..nelem."""
+    from solution import kernels as K
+
+    out = torch.empty(nelem, device=DEV, dtype=torch.int8)
+    K.torch_dropout_keep_kernel[(triton_cdiv(nelem, 1024),)](out, nelem, seed, ctr, threads,
+                                                             1.0 - p, VEC=vec, BLOCK=1024)
+    return out.bool()
+
+
+def triton_cdiv(a, b):
+    return (a + b - 1) // b
+
+
+@pytest.mark.parametrize("shape,dtype,p", [((4, 37, 1536), torch.float32, 0.05),
+                                           ((2, 300, 1536), torch.float32, 0.1),
+                                           ((1, 7, 1536), torch.float32, 0.25),
+                                           ((3, 5, 64), torch.float16, 0.1),
+                                           ((4, 512, 1536), torch.float16, 0.05)])
+def test_dropout_masks_are_torchs(shape, dtype, p):
+    """The LoRA dropout masks are PyTorch's own: TorchDropout.draw takes the CUDA generator's
+    state as nn.Dropout would and advances it the same way, and our kernel's mask from it is
+    the one F.dropout draws on a tensor of that shape and dtype, bit for bit (one thread
+    iteration or several, a grid below the device's maximum or at it)."""
+    from solution.engine import TorchDropout
+
+    torch.cuda.manual_seed(1234)
+    drop = TorchDropout(torch.device(DEV), dtype)
+    nelem = math.prod(shape)
+    for _ in range(3):
+        state = drop.gen.get_state()
+        seed, ctr, threads = drop.draw(nelem)
+        after = drop.gen.get_offset()
+        drop.gen.set_state(state)
+        ref = torch.nn.functional.dropout(torch.ones(shape, device=DEV, dtype=dtype), p,
+                                          training=True) != 0
+        assert drop.gen.get_offset() == after
+        assert torch.equal(_torch_keep(nelem, seed, ctr, threads, p, drop.vec), ref.reshape(-1))
+
+
 @pytest.mark.parametrize("n,H", [(37, 1536), (5, 100)])
 def test_rmsnorm_forward_backward(n, H):
     from solution.engine import _rms_bwd, _rms_fwd
@@ -59,6 +100,9 @@ def test_rmsnorm_forward_backward(n, H):
     w = torch.rand(H, device=DEV) + 0.5
     p = 0.25
     packed, spec = _Packed(p), _Spec()
+    # the rows as tokens of a padded batch (TorchDropout's masks are over its elements)
+    packed.tok = torch.arange(n, device=DEV) * 3 + 1
+    packed.drop_seed, packed.drop_threads, packed.drop_vec = 77, 40960, 4
     xsum, y, yq, yv, rstd = _rms_fwd(spec, x, w, packed, delta=delta, seeds=(11, 12),
                                      drop_q=True, drop_v=True)
 
@@ -70,6 +114,10 @@ def test_rmsnorm_forward_backward(n, H):
     assert 0.15 < 1 - mask_q.float().mean().item() < 0.35
     assert not torch.equal(mask_q, mask_v)
     close(yq, torch.where(mask_q, yr / (1 - p), 0.0), 2e-3)
+    elems = (packed.tok[:, None] * H + torch.arange(H, device=DEV)[None]).reshape(-1)
+    nelem = int(elems.max()) + 1
+    for mask, ctr in ((mask_q, 11), (mask_v, 12)):
+        assert torch.equal(mask.reshape(-1), _torch_keep(nelem, 77, ctr, 40960, p, 4)[elems])
 
     # the same seeds regenerate the same masks
     _, _, yq2, yv2, _ = _rms_fwd(spec, xsum, w, packed, write_y=False, seeds=(11, 12),
@@ -311,6 +359,47 @@ def test_fused_step_matches_hf(tmp_path, lengths, host):
         assert rel < 2e-2, rel.item()
 
 
+@pytest.mark.parametrize("lengths", [[17, 60, 33, 5], [40, 40]])
+def test_fused_step_dropout_matches_hf(tmp_path, lengths):
+    """With LoRA dropout: from the same CUDA generator state the fused step draws PEFT's own
+    masks (the gradients would differ by far more than 2e-2 with other ones), and leaves the
+    generator where PEFT's forward leaves it."""
+    from solution.engine import FusedQwen2
+
+    model = _tiny_model(tmp_path, dropout=0.1)
+    model.train()
+    torch.manual_seed(1)
+    B, T = len(lengths), max(lengths)
+    ids = torch.randint(0, 3000, (B, T), device=DEV)
+    mask = (torch.arange(T, device=DEV)[None] < torch.tensor(lengths, device=DEV)[:, None])
+    mask = mask.long()
+    ids = torch.where(mask.bool(), ids, 0)
+    labels = torch.where(mask.bool(), ids, -100)
+    labels[:, :3] = -100
+    n_items = (labels[:, 1:] != -100).sum()
+    params = [p for p in model.parameters() if p.requires_grad]
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+
+    torch.cuda.manual_seed(5)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(input_ids=ids, attention_mask=mask, labels=labels,
+                    num_items_in_batch=n_items)
+    ref_offset = gen.get_offset()
+    ref_loss = out.loss.float()
+    ref_grads = torch.autograd.grad(ref_loss, params)
+
+    engine = FusedQwen2(model)
+    torch.cuda.manual_seed(5)
+    loss, packed, stats = engine.step(ids, mask, labels, float(n_items))
+    assert gen.get_offset() == ref_offset
+    grads = torch.autograd.grad(loss, params)
+    engine.restore_weights()
+    assert abs(loss.item() - ref_loss.item()) / ref_loss.item() < 2e-3
+    for g, r in zip(grads, ref_grads):
+        rel = (g.float() - r.float()).norm() / r.float().norm().clamp(min=1e-12)
+        assert rel < 2e-2, rel.item()
+
+
 def test_weight_streaming_is_exact(tmp_path):
     from solution.engine import FusedQwen2
 
@@ -326,7 +415,8 @@ def test_weight_streaming_is_exact(tmp_path):
     before = {n: p.detach().clone() for n, p in model.named_parameters() if p.is_cuda}
 
     def run(offload):
-        engine = FusedQwen2(model, seed=7)
+        torch.cuda.manual_seed(7)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         if offload:
             engine.offload_weights()
         loss, _, _ = engine.step(ids, mask, labels, 50.0)
@@ -384,7 +474,8 @@ def test_keeping_gate_up_is_exact(tmp_path):
     params = [p for p in model.parameters() if p.requires_grad]
 
     def run(cap):
-        engine = FusedQwen2(model, seed=5)
+        torch.cuda.manual_seed(5)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         if cap:
             engine.set_memory_cap(cap)
         assert engine.layers_to_keep(60) == (len(engine.layers) if cap else 0)
@@ -412,7 +503,8 @@ def test_keeping_everything_is_exact(tmp_path):
     params = [p for p in model.parameters() if p.requires_grad]
 
     def run(cap):
-        engine = FusedQwen2(model, seed=9)
+        torch.cuda.manual_seed(9)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         if cap:
             engine.set_memory_cap(cap)
             assert engine.keep_plan(57) == (len(engine.layers), len(engine.layers))
@@ -441,7 +533,8 @@ def test_lean_step_matches(tmp_path):
     params = [p for p in model.parameters() if p.requires_grad]
 
     def run(lean):
-        engine = FusedQwen2(model, seed=4)
+        torch.cuda.manual_seed(4)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
         engine.offload_weights()
         if lean:
             engine.mlp_chunk = 16
