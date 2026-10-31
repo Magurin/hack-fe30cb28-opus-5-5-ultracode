@@ -662,6 +662,7 @@ class TorchDropout:
     BLOCK, UNROLL = 256, 4  # Dropout.cu: block_size, UNROLL
 
     CHECK_SEED = 20261031  # the self-check's own generator
+    CHECK_TOKENS = 64  # tokens per row in the self-check
 
     def __init__(self, device, dtype):
         self.device, self.dtype = device, dtype
@@ -1623,8 +1624,11 @@ class FusedQwen2:
         packed = Packed(input_ids, attention_mask, labels, self.rope, self.dropout,
                         self.dropout_p)
         if self.dropout is not None and self.dropout.ok is None:
-            self.dropout.ok = self.dropout.check(packed.rows, packed.T, self.layers[0].H,
-                                                 self.dropout_p)
+            # the step's rows, up to CHECK_TOKENS tokens each (4 x 64 x 1536 elements: every
+            # one of a T4's 40960 threads draws for 2-3 iterations; 4 MiB, nothing at the peak)
+            self.dropout.ok = self.dropout.check(
+                packed.rows, min(packed.T, TorchDropout.CHECK_TOKENS), self.layers[0].H,
+                self.dropout_p)
             if not self.dropout.ok:
                 warnings.warn("solution: our LoRA dropout masks are not PyTorch's on this GPU / "
                               "build; training with the original code path")
