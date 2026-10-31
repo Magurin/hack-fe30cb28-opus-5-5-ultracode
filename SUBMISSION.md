@@ -9,10 +9,10 @@ backward тоже ждут на хосте (последние - вместо п
 Подробно - `README.md`.
 
 ## Links
-- Repository, code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c
-  (`solution_sha256` `9efa8ec1`). Since then `main` also has the late warm-up with NF4 loaded straight
-  into pinned memory (`feca479`, `43765db`, `838827f`): -0.4..-0.9 s out of the loop in Kaggle A/Bs;
-  the official measurement of the current `main` will replace this
+- Repository, final code = code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c
+  (`solution_sha256` `9efa8ec1`); `main` has the same code. The late warm-up with NF4 loaded straight
+  into pinned memory (-0.3..-0.85 s out of the loop in Kaggle A/Bs) was tested after the measurement
+  and is not in the final code (no official measurement in time)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
   (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
@@ -96,11 +96,9 @@ RoPE, SwiGLU, голова кусками словаря с online logsumexp), �
 ## Limitations
 См. README.md, "Ограничения и что не получилось": решение заточено под Qwen2 + NF4 + LoRA на q/v в
 fp16 (иначе исходный код Soup); GEMM cuBLAS ~69% работы GPU и свой GEMM на Triton для T4 не
-получился; вне цикла обучения выигрыш небольшой (~11 с патчами запуска по сумме A/B отдельных
+получился; вне цикла обучения выигрыш небольшой (~10 с патчами запуска по сумме A/B отдельных
 патчей, из них -1,8 с - выход через `os._exit` после всех обработчиков выхода, разрешение
-[t.me/souptasterschat/5199](https://t.me/souptasterschat/5199), и ~-0,9 с - прогрев в конце `apply()`,
-дешёвый ключ кэша Triton ([t.me/souptasterschat/2922](https://t.me/souptasterschat/2922), п. 2) и NF4
-загрузчиком прямо в pinned-буфер стриминга; своя токенизация без `datasets.map`
+[t.me/souptasterschat/5199](https://t.me/souptasterschat/5199); своя токенизация без `datasets.map`
 запрещена и убрана); ниже ~461 MiB пик не опускается:
 ~113-115 MiB - вне аллокатора PyTorch (CUDA-контекст ~65, модуль кастов PyTorch, cuBLAS), а резерв
 аллокатора 346 MiB держит фрагментация (настройки аллокатора харнесса менять нельзя); выгрузки
