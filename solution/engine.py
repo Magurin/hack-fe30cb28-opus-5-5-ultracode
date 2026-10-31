@@ -547,6 +547,75 @@ class GuStream(_HostRing):
             self._copy_out(i, self.ring[i % self.SLOTS, :self.n])
 
 
+class AttnStream(_HostRing):
+    """What the backward of a layer that loads its [gate | up] from GuStream would otherwise
+    recompute before it: q, k, v (RoPE applied), the attention output and the o_proj output, in
+    pinned host memory between forward and backward, for the layers GuStream holds. The
+    backward then runs only the two RMSNorms again (the LoRA inputs and their dropout masks,
+    the residual after attention from o), not the qkv and o GEMMs, RoPE and the attention: on a
+    T4 ~20 ms of a step. k and v go out as their HKV heads, not the HQ heads the attention
+    reads, and are expanded again after the copy back. The attention's logsumexp and seeds stay
+    on the GPU (a few KiB per layer). Values are copies: the backward is bit for bit the one
+    that recomputes."""
+
+    def __init__(self, layers, device):
+        super().__init__(layers, device)
+        self.small = [None] * layers  # per layer: (lse, seed, offset) on the GPU
+
+    def cols(self, spec):
+        return 2 * spec.HQ * spec.D + 2 * spec.HKV * spec.D + spec.H
+
+    def ring_bytes(self, n, spec):
+        return self.SLOTS * n * self.cols(spec) * 2
+
+    def begin(self, n, spec):
+        cols = self.cols(spec)
+        self._host_rows(n, cols, torch.float16)
+        self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
+        self.n = n
+        self.upto = 0
+        self.in_slot = [None] * self.SLOTS
+        self.small = [None] * self.L
+
+    def release(self):
+        self.ring = None
+        self.small = [None] * self.L
+
+    def holds(self, i):
+        return i < self.upto
+
+    def _views(self, flat, spec):
+        n, HQ, HKV, D, H = self.n, spec.HQ, spec.HKV, spec.D, spec.H
+        sizes = (n * HQ * D, n * HKV * D, n * HKV * D, n * HQ * D, n * H)
+        parts = torch.split(flat.reshape(-1), sizes)
+        return (parts[0].view(n, HQ, D), parts[1].view(n, HKV, D), parts[2].view(n, HKV, D),
+                parts[3].view(n, HQ, D), parts[4].view(n, H))
+
+    def save(self, i, spec, q, k_e, v_e, out, o, lse, seed, offset):
+        """Forward of layer i, after its o_proj: its tensors into the slot, copied out."""
+        rep = spec.HQ // spec.HKV
+        sq, sk, sv, so, s_o = self._views(self._slot(i), spec)
+        sq.copy_(q)
+        sk.copy_(k_e.view(self.n, spec.HKV, rep, spec.D)[:, :, 0])
+        sv.copy_(v_e.view(self.n, spec.HKV, rep, spec.D)[:, :, 0])
+        so.copy_(out.view(self.n, spec.HQ, spec.D))
+        s_o.copy_(o)
+        self.small[i] = (lse, seed, offset)
+        if not self._stays(i):
+            self._copy_out(i, self.ring[i % self.SLOTS, :self.n])
+
+    def load_attn(self, i, spec):
+        """Backward of layer i: (q, k_e, v_e, out, o, lse, seed, offset) on the current stream."""
+        q, k, v, out, o = self._views(self.load(i), spec)
+        rep = spec.HQ // spec.HKV
+        shape = (self.n, spec.HKV, rep, spec.D)
+        k_e = k[:, :, None].expand(shape).reshape(self.n, spec.HQ, spec.D)
+        v_e = v[:, :, None].expand(shape).reshape(self.n, spec.HQ, spec.D)
+        lse, seed, offset = self.small[i]
+        self.small[i] = None
+        return q, k_e, v_e, out, o, lse, seed, offset
+
+
 def _pin_in_place(t, device):
     """Page-lock a contiguous CPU tensor's memory where it is (cudaHostRegister, as
     torch.cuda._pin_memory_utils does) instead of copying it into a new pinned buffer: for the
@@ -633,6 +702,7 @@ class Packed:
         self.keep_all_from = 1 << 30  # ... and from this one every intermediate
         self.inputs = None  # an InputStream, if the layer inputs wait in host memory
         self.gus = None  # a GuStream, if [gate | up] of the layers below gus.upto does
+        self.attns = None  # an AttnStream, if their attention tensors wait in host memory too
         self.lean = False  # recompute and run the MLP in parts (FusedQwen2.lean)
         self.mlp_chunk = MLP_CHUNK
 
@@ -938,7 +1008,7 @@ def _layer_output(spec, packed, h2, d):
 
 
 def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=False, full=False,
-                   part=None):
+                   part=None, attn=None):
     """One decoder layer forward. With keep=True (the backward's recomputation) returns what the
     backward reads, dequantized weights included; a `gu` kept from the forward replaces the
     gate/up GEMM. Otherwise returns h3 and, with return_gu, the [gate | up] GEMM output, or with
@@ -961,7 +1031,8 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
 
     # q, k, v in one GEMM; LoRA as two thin GEMMs per target
     w = dequant([spec.w["q_proj"], spec.w["k_proj"], spec.w["v_proj"]], dev)
-    qkv = torch.addmm(spec.bias_qkv, a, w.t())
+    if attn is None:
+        qkv = torch.addmm(spec.bias_qkv, a, w.t())
     del a
     if keep:
         saved["w_qkv"] = w
@@ -969,14 +1040,18 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
     xq = xv = lq = lv = None
     if aq_w is not None:
         xq = aq @ aq_w.t()
-        lq = xq @ bq_w.t()
+        lq = None if attn is not None else xq @ bq_w.t()
     if av_w is not None:
         xv = av @ av_w.t()
-        lv = xv @ bv_w.t()
-    q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
-    del qkv, lq, lv
-    k_e, v_e = k, v
-    out, lse, aseed, aoffset = _attn_fwd(q, k_e, v_e, packed, spec.scale)
+        lv = None if attn is not None else xv @ bv_w.t()
+    if attn is not None:  # the forward's tensors, from host memory (AttnStream)
+        q, k_e, v_e, out, o, lse, aseed, aoffset = attn
+        k, v = k_e, v_e
+    else:
+        q, k, v = _rope_fwd(spec, qkv, lq, lv, packed, lora_scale)
+        del qkv, lq, lv
+        k_e, v_e = k, v
+        out, lse, aseed, aoffset = _attn_fwd(q, k_e, v_e, packed, spec.scale)
     if part == "attention":
         saved.update(rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e, out=out,
                      lse=lse, aseed=aseed, aoffset=aoffset)
@@ -986,11 +1061,15 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         del aq, av, xq, xv, q, k, v, k_e, v_e, lse
 
     w = dequant([spec.w["o_proj"]], dev)
-    o = out.reshape(n, HQ * D) @ w.t()
+    if attn is None:
+        o = out.reshape(n, HQ * D) @ w.t()
     if keep:
         saved["w_o"] = w
     del w
     h2, b, _, _, rstd2 = _rms_fwd(spec, h, spec.ln2, packed, delta=o)
+    if not keep and part is None and packed.attns is not None \
+            and packed.attns.holds(spec.index):
+        packed.attns.save(spec.index, spec, q, k_e, v_e, out, o, lse, aseed, aoffset)
     del o
     if part == "mlp_input":
         return None, {"h2": h2, "rstd2": rstd2, "b": b}
@@ -1126,8 +1205,14 @@ class _Layer(torch.autograd.Function):
                 if gu is None and packed.gus is not None and packed.gus.holds(spec.index) \
                         and not packed.gus.chunk:
                     gu = packed.gus.load(spec.index)
+                attn = None
+                if gu is not None and packed.attns is not None \
+                        and packed.attns.holds(spec.index):
+                    attn = packed.attns.load_attn(spec.index, spec)
                 with torch.no_grad():
-                    _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=gu)
+                    _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=gu,
+                                          attn=attn)
+                del attn
                 ctx.kept_gu = gu = None
 
             # MLP
@@ -1425,6 +1510,7 @@ class FusedQwen2:
         self.registered = None  # the embedding's host memory, if pinned where the loader put it
         self.inputs = None  # an InputStream while the layer inputs go to host memory
         self.gus = None  # a GuStream while [gate | up] outputs may go to host memory
+        self.attns = None  # an AttnStream while those layers' attention tensors may too
         self.embed_module = inner.embed_tokens
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
         self.norm_w = inner.norm.weight
@@ -1573,6 +1659,12 @@ class FusedQwen2:
         if self.gus is None:
             self.gus = GuStream(len(self.layers), self.device)
 
+    def offload_attns(self):
+        """Keep the attention tensors of the layers GuStream holds in pinned host memory too
+        (AttnStream): their backward recomputes nothing but the two RMSNorms."""
+        if self.attns is None:
+            self.attns = AttnStream(len(self.layers), self.device)
+
     def restore_head(self):
         """Put the embedding / lm_head weight back on the GPU."""
         if self.embed.device != self.device:
@@ -1615,6 +1707,8 @@ class FusedQwen2:
         self.inputs = None  # its device ring and pinned buffer (offload_inputs makes them again)
         if self.gus is not None:
             self.gus.release()  # its device ring (its pinned buffers stay for the next steps)
+        if self.attns is not None:
+            self.attns.release()
         if self.stream is not None:
             for spec in self.layers:
                 spec.stream = None
@@ -1648,6 +1742,8 @@ class FusedQwen2:
             packed.inputs = self.inputs
         L = len(self.layers)
         cols = 2 * self.layers[0].I
+        if self.attns is not None:
+            self.attns.release()
         if self.gus is not None:
             self.gus.release()
             if self.layers_to_keep(packed.n) < L:
@@ -1658,7 +1754,15 @@ class FusedQwen2:
                 # lean step recomputes: its [gate | up] copies (every layer, 2 GB each way for
                 # 2048 tokens) made a T4 instance's 4 x 512-token run 10 s slower.
                 chunks = self.gus.chunk_ring_bytes(self.mlp_chunk, cols)
-                if not self.lean(packed.n, self.gus.ring_bytes(packed.n, cols)):
+                ring = self.gus.ring_bytes(packed.n, cols)
+                attn = (self.attns.ring_bytes(packed.n, self.layers[0])
+                        if self.attns is not None else None)
+                if attn is not None and not self.lean(packed.n, ring + attn):
+                    # and the attention tensors of the same layers, if the step with both rings
+                    # still needs no lean recomputation
+                    self.attns.begin(packed.n, self.layers[0])
+                    packed.attns = self.attns
+                if not self.lean(packed.n, ring + (attn if packed.attns is not None else 0)):
                     self.gus.begin(packed.n, cols)
                     packed.gus = self.gus
                 elif not self.lean(packed.n, chunks):
@@ -1671,6 +1775,9 @@ class FusedQwen2:
         packed.lean = k_gu == 0 and self.lean(packed.n)
         if packed.gus is not None:
             packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
+        if packed.attns is not None:
+            packed.attns.upto = packed.gus.upto if packed.gus is not None \
+                and not packed.gus.chunk else 0
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)

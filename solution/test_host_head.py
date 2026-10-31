@@ -372,6 +372,54 @@ def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, lay
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
 
 
+@pytest.mark.parametrize("slots,k_gu,layers", [(1, 0, 2), (2, 0, 2), (2, 0, 7), (2, 3, 7)])
+def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, layers):
+    """The attention tensors of the layers GuStream holds, in pinned host memory too
+    (AttnStream), so their backward recomputes only the RMSNorms: bit-identical loss and LoRA
+    gradients against recomputing them (GuStream alone), over two steps with the weights, head
+    and layer inputs on the host; with 7 layers the ring's slots are written again and the
+    backward fetches ahead; with k_gu the last layers keep their [gate | up] on the GPU (and
+    recompute their attention)."""
+    from solution.engine import AttnStream, FusedQwen2, GuStream
+    from solution.patch import _embedding_to_fp16
+
+    monkeypatch.setattr(GuStream, "SLOTS", slots)
+    monkeypatch.setattr(AttnStream, "SLOTS", slots)
+    monkeypatch.setattr(FusedQwen2, "layers_to_keep", lambda self, n: k_gu)
+    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
+    params = [p for p in model.parameters() if p.requires_grad]
+    loaded = []
+
+    def run(attn_on_host):
+        torch.cuda.manual_seed(11)  # the LoRA dropout masks (TorchDropout)
+        engine = FusedQwen2(model)
+        engine.offload_weights()
+        engine.offload_head()
+        engine.offload_inputs()
+        engine.offload_gus()
+        if attn_on_host:
+            engine.offload_attns()
+            load = engine.attns.load_attn
+            monkeypatch.setattr(engine.attns, "load_attn",
+                                lambda i, spec: loaded.append(i) or load(i, spec))
+        out = []
+        for ids, mask, labels in batches:
+            loss, packed, _ = engine.step(ids, mask, labels, 80.0)
+            assert (packed.attns is not None) == attn_on_host
+            assert not attn_on_host or packed.attns.upto == layers - k_gu
+            out.append((loss, torch.autograd.grad(loss, params)))
+        engine.restore_weights()
+        return out
+
+    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
+        assert torch.equal(loss_a, loss_b)
+        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+    assert sorted(loaded) == sorted(list(range(layers - k_gu)) * len(batches))
+
+
 def test_cuda_stack_limit_leaves_the_kernels_alone():
     """With the CUDA thread stack set to 16 bytes (patch.CUDA_STACK_BYTES) the limit holds and
     cuBLAS, attention and our kernels give the same results as with CUDA's default."""

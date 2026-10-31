@@ -42,6 +42,9 @@ OFFLOAD_ACTIVATIONS = True
 # 6b1cc09, 3 warm pairs: 1.7-2.6 s faster, peak the same; on a Brev T4, with half the bus,
 # ~5 s slower
 OFFLOAD_GU = True
+# and those layers' q, k, v, attention output and o_proj output (engine.AttnStream): their
+# backward recomputes only the two RMSNorms, not the qkv / o GEMMs, RoPE and the attention
+OFFLOAD_ATTN = True
 # put each NF4 layer weight in host memory right after the loader quantizes it
 # (solution/hostload.py); the fused step then streams them, so it requires OFFLOAD_WEIGHTS
 HOST_NF4_AT_LOAD = True
@@ -272,6 +275,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         engine.offload_inputs()
     if OFFLOAD_GU:
         engine.offload_gus()
+        if OFFLOAD_ATTN:
+            engine.offload_attns()
     from .engine import UnsupportedBatch
 
     try:
