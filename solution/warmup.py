@@ -142,6 +142,20 @@ def _run(dims, dropout_p):
         finally:
             E._COMPILE_ONLY.kernels = None
 
+    # Pin the host memory the NF4 weights will be streamed from (WeightStream) first, before the
+    # compilation: pinning ~650 MB costs ~0.15 s, and PyTorch's caching host allocator hands the
+    # freed block (rounded up to a power of two) to the same-sized request at the first training
+    # step. Done after the compilation, it kept the start of training waiting longer (Brev A/B:
+    # 0.55 s instead of 0.10 s).
+    values = dims["L"] * H * (HQ * D + 2 * HKV * D + HQ * D + 3 * I)
+    pinned = torch.empty((values // 2 + values // 64,), dtype=torch.uint8, pin_memory=True)
+    del pinned
+    # ... and the layer inputs' (engine.InputStream). The embedding / lm_head weight needs none:
+    # engine.HostHead pins it where the loader left it.
+    pinned = torch.empty((dims["L"], E.InputStream.HOST_ROWS, H), dtype=torch.float32,
+                         pin_memory=True)
+    del pinned
+
     # One task per @triton.jit function (its variants one after the other), so with several
     # threads no two compile into the same kernel's cache.
     jobs = [rms_forward, rms_backward, glu, ce, ce_pieces, nf4,
@@ -153,18 +167,6 @@ def _run(dims, dropout_p):
                              initializer=_lower_priority) as pool):
         for future in [pool.submit(compile_only, job) for job in jobs]:
             future.result()
-
-    # Pin the host memory the NF4 weights will be streamed from (WeightStream) now: pinning
-    # ~650 MB costs ~0.15 s, and PyTorch's caching host allocator hands the freed block (rounded
-    # up to a power of two) to the same-sized request at the first training step.
-    values = dims["L"] * H * (HQ * D + 2 * HKV * D + HQ * D + 3 * I)
-    pinned = torch.empty((values // 2 + values // 64,), dtype=torch.uint8, pin_memory=True)
-    del pinned
-    # ... and the layer inputs' (engine.InputStream). The embedding / lm_head weight needs none:
-    # engine.HostHead pins it where the loader left it.
-    pinned = torch.empty((dims["L"], E.InputStream.HOST_ROWS, H), dtype=torch.float32,
-                         pin_memory=True)
-    del pinned
 
 
 def fp16_path_gpu():
