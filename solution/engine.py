@@ -1380,6 +1380,9 @@ class HostHead:
     PIECE = 8192  # vocabulary rows per piece (24 MiB); a multiple of the CE kernels' BLOCK
     BUFFERS = 3
     PREFETCH_LAYERS = 3  # the copies start once the forward reaches the last this many layers
+    # buffers taken by that prefetch; the others once the head starts: the step peaks in the
+    # forward of its last layers (those keeping [gate | up] on the GPU), not in the head
+    PREFETCH_BUFFERS = 2
 
     def __init__(self, weight, device):
         self.weight, self.device = weight, device
@@ -1424,16 +1427,24 @@ class HostHead:
         """Start copying the first pieces once the compute stream gets here."""
         if self.bufs is not None:
             return
-        self.bufs = [torch.empty((self.PIECE, self.H), device=self.device, dtype=self.host.dtype)
-                     for _ in range(self.BUFFERS)]
+        self.bufs = []
+        self._more(self.PREFETCH_BUFFERS)
+
+    def _more(self, count):
+        """Take `count` more buffers and start copying their first pieces (the copy stream
+        first waits for the compute stream's last use of that memory)."""
+        first = len(self.bufs)
+        self.bufs += [torch.empty((self.PIECE, self.H), device=self.device,
+                                  dtype=self.host.dtype) for _ in range(count)]
         self.start.record(torch.cuda.current_stream(self.device))
         self.stream.wait_event(self.start)
-        for j in range(min(self.BUFFERS, len(self.pieces))):
+        for j in range(first, min(first + count, len(self.pieces))):
             self._copy(j)
 
     def stream_pieces(self):
         """Yield (first row, rows, device piece) for the whole vocabulary, in order."""
         self.prefetch()
+        self._more(self.BUFFERS - len(self.bufs))
         current = torch.cuda.current_stream(self.device)
         for j, (v0, width) in enumerate(self.pieces):
             b = j % self.BUFFERS
