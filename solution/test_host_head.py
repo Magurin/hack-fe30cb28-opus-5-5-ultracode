@@ -420,7 +420,7 @@ def test_attention_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, l
     assert sorted(loaded) == sorted(list(range(layers - k_gu)) * len(batches))
 
 
-@pytest.mark.parametrize("case", ["chunks", "lean", "border"])
+@pytest.mark.parametrize("case", ["chunks", "lean", "border", "late"])
 def test_attention_ring_only_beside_whole_gate_up_ring(tmp_path, monkeypatch, case):
     """AttnStream is taken only beside a ring of whole [gate | up] outputs: not on a step whose
     [gate | up] goes to host memory in chunks, not on a lean step, and not when the GuStream
@@ -448,15 +448,22 @@ def test_attention_ring_only_beside_whole_gate_up_ring(tmp_path, monkeypatch, ca
         n = int(mask.sum())
         ring = GuStream.SLOTS * n * 2 * engine.layers[0].I * 2
         chunks = GuStream.SLOTS * 32 * 2 * engine.layers[0].I * 2
-        limit = {"chunks": chunks, "lean": -1, "border": ring}[case]
-        monkeypatch.setattr(FusedQwen2, "lean", lambda self, n, extra=0: extra > limit)
+        if case == "late":  # both rings pass, the whole GuStream one then does not: chunks
+            monkeypatch.setattr(FusedQwen2, "lean",
+                                lambda self, n, extra=0: extra == ring or extra > 10 * ring)
+        else:
+            limit = {"chunks": chunks, "lean": -1, "border": ring}[case]
+            monkeypatch.setattr(FusedQwen2, "lean", lambda self, n, extra=0: extra > limit)
         if attn_on_host:
             engine.offload_attns()
             monkeypatch.setattr(engine.attns, "load_attn", lambda i, spec: pytest.fail("loaded"))
+            begin = engine.attns.begin
+            monkeypatch.setattr(engine.attns, "begin",
+                                lambda *a: begun.append(a) or begin(*a))
         loss, packed, _ = engine.step(ids, mask, labels, 80.0)
         assert packed.attns is None
         assert not attn_on_host or engine.attns.ring is None
-        if case == "chunks":
+        if case in ("chunks", "late"):
             assert packed.gus.chunk == 32 and not packed.lean
         elif case == "lean":
             assert packed.gus is None and packed.lean
@@ -466,10 +473,12 @@ def test_attention_ring_only_beside_whole_gate_up_ring(tmp_path, monkeypatch, ca
         engine.restore_weights()
         return loss, grads
 
+    begun = []
     loss_a, grads_a = run(False)
     loss_b, grads_b = run(True)
     assert torch.equal(loss_a, loss_b)
     assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+    assert bool(begun) == (case == "late")  # there taken first, then freed before the chunks
 
 
 def test_cuda_stack_limit_leaves_the_kernels_alone():

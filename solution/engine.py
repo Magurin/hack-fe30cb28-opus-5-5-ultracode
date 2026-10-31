@@ -1798,12 +1798,13 @@ class FusedQwen2:
                 if not self.lean(packed.n, ring):
                     self.gus.begin(packed.n, cols)
                     packed.gus = self.gus
-                elif not self.lean(packed.n, chunks):
-                    self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
-                    packed.gus = self.gus
-        if packed.attns is not None and (packed.gus is None or packed.gus.chunk):
-            self.attns.release()  # only beside a ring of whole [gate | up] outputs
-            packed.attns = None
+                else:
+                    if packed.attns is not None:  # only beside a ring of whole outputs: freed
+                        self.attns.release()  # before the chunks' check, which it would skew
+                        packed.attns = None
+                    if not self.lean(packed.n, chunks):
+                        self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
+                        packed.gus = self.gus
         k_gu, k_all = self.keep_plan(packed.n)
         packed.keep_gu_from = L - k_gu
         packed.keep_all_from = L - k_all
