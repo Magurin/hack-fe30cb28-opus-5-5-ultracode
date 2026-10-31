@@ -66,7 +66,7 @@ EXTRA_MEMORY_MIB = 0
 # activations, instead of the (would-be) load peak minus KEEP_MARGIN. With the layer inputs in
 # host memory too, a T4 run of the public rows peaked at 795 / 715 / 635 MiB with 591 (the
 # would-be load rule) / 500 / 420, loop 27.10 / 27.28 / 27.53 s: 420 gives up 160 MiB for 0.4 s.
-STEP_CAP_MIB = 396
+STEP_CAP_MIB = 340
 # The per-thread stack the CUDA context reserves device memory for: 1 KiB by default for every
 # thread the GPU can hold at once, 40 MiB on a T4 outside PyTorch's allocator. Our kernels and the
 # ones PyTorch / cuBLAS launch here need none, and the driver raises the limit by itself for a
