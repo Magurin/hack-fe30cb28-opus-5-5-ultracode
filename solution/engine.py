@@ -159,13 +159,14 @@ class NF4Group:
 
 class WeightStream:
     """The packed NF4 weights of every decoder layer live in pinned host memory during training;
-    a layer's bytes are copied into one of three device slots on a side stream, one layer ahead
-    of the compute (forward: i+1, backward: i-1). Slot i % 3 is only overwritten after the
-    compute stream has finished with the layer that held it before. 23 MiB per Qwen2.5-1.5B
-    layer, so 69 MiB on the GPU instead of ~645 MiB, for ~1.3 GB of PCIe traffic per step that
-    runs alongside the GEMMs."""
+    a layer's bytes are copied into one of two device slots on a side stream, one layer ahead
+    of the compute (forward: i+1, backward: i-1). Slot i % 2 is only overwritten after the
+    compute stream has finished with the layer that held it before (i - 1 in forward, i + 1 in
+    backward), so the copy runs while layer i computes. 23 MiB per Qwen2.5-1.5B layer, so 46 MiB
+    on the GPU instead of ~645 MiB, for ~1.3 GB of PCIe traffic per step that runs alongside the
+    GEMMs; the last two layers of the forward are still in their slots for the backward."""
 
-    SLOTS = 3
+    SLOTS = 2
     # weights dequantized together into one buffer (one GEMM each): stored back to back, so one
     # kernel launch dequantizes the whole group
     GROUPS = (("q_proj", "k_proj", "v_proj"), ("o_proj",), ("gate_proj", "up_proj"),
