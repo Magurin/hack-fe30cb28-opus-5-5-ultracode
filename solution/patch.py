@@ -441,8 +441,54 @@ def patch_library_overheads():
         metadata.packages_distributions = packages_distributions
 
 
+# bf16 values converted per copy in patch_weight_conversion (8 MiB of GPU memory at a time)
+CONVERT_CHUNK = 4 * 2**20
+
+
+def _is_cuda(device):
+    try:
+        return torch.device(device).type == "cuda"
+    except (RuntimeError, TypeError, ValueError):
+        return False
+
+
+def patch_weight_conversion():
+    """transformers loads every checkpoint tensor with `tensor.to(device=cuda, dtype=fp16)`; from a
+    bf16 checkpoint PyTorch converts it on the CPU first, element by element (~1.5 s for
+    Qwen2.5-1.5B on a 2-core CPU, more while our kernels compile next to it). Copied as bf16 and
+    converted on the GPU instead, a CONVERT_CHUNK of values at a time into the fp16 tensor the
+    load would have made: the same IEEE rounding, the same bits (all 338 tensors of the
+    checkpoint checked), and 8 MiB of GPU memory more for a moment. Other conversions and other
+    devices go through transformers' own code."""
+    try:
+        from transformers import core_model_loading
+    except ImportError:  # another transformers: its loader as it is
+        return
+    original = getattr(core_model_loading, "_materialize_copy", None)
+    if original is None or getattr(original, "_soup_kernels_patched", False):
+        return
+
+    @functools.wraps(original)
+    def _materialize_copy(tensor, device=None, dtype=None):
+        tensor = tensor[...]
+        if dtype == torch.float16 and tensor.dtype == torch.bfloat16 \
+                and tensor.device.type == "cpu" and _is_cuda(device):
+            out = torch.empty(tensor.shape, device=device, dtype=dtype)
+            src, dst = tensor.reshape(-1), out.view(-1)
+            for i in range(0, src.numel(), CONVERT_CHUNK):
+                dst[i:i + CONVERT_CHUNK].copy_(src[i:i + CONVERT_CHUNK].to(device))
+            return out
+        if dtype is not None or device is not None:
+            tensor = tensor.to(device=device, dtype=dtype)
+        return tensor
+
+    _materialize_copy._soup_kernels_patched = True
+    core_model_loading._materialize_copy = _materialize_copy
+
+
 def patch_soup():
     patch_library_overheads()
+    patch_weight_conversion()
     from . import startup
 
     startup.import_without_wandb(sys.argv)  # imports trl, so after the snapshot above
