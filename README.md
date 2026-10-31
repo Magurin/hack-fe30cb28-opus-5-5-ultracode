@@ -305,9 +305,11 @@ nvidia-smi базы на T4 - 14 345 MiB, из них 13 373 MiB - тензор�
 | + входы слоёв для backward в pinned-памяти CPU, кольцо из 3 слотов на GPU (`6b1cc09`) | 735 nvidia-smi при прежнем потолке шага | Brev T4 |
 | + потолок шага 420 MiB allocated вместо расчётного 591 (больше пересчёта `[gate \| up]`) | **635** nvidia-smi (хвост до 1 954 токенов: 615, стресс 4 x 512: 613) | Brev T4 |
 | + `[gate \| up]` на хосте вместо пересчёта, кольцо из 2 слотов на GPU (`869380e`) - ради скорости, не памяти | 617-639 на 5 срезах (публичные: 639), хвост 619, стресс 613-617 | Brev T4 |
+| + стек потоков CUDA 16 байт вместо 1 KiB на поток (`aafb9a7`): контекст CUDA больше не держит под него 40 MiB | публичные **597-599** (m 23,95), хвост 579-599, 10/10 | Brev T4 |
 
-Итог (Kaggle, `3d06a30`): allocated 419 MiB, reserved 468 MiB, nvidia-smi **639 MiB**.
-Оставшиеся ~170 MiB вне аллокатора PyTorch - это CUDA-контекст, модули наших кернелов и cuBLAS. На GPU больше нет ни одного
+Итог (Kaggle, `3d06a30`): allocated 419 MiB, reserved 468 MiB, nvidia-smi **639 MiB**; с лимитом
+стека CUDA (`aafb9a7`) на Brev - 597-599 MiB. Оставшиеся вне аллокатора PyTorch ~170 MiB (с лимитом
+стека ~130) - это CUDA-контекст, модули наших кернелов и cuBLAS. На GPU больше нет ни одного
 замороженного веса целиком и ни одного отложенного входа слоя: только нормы, LoRA, состояние
 двойной квантизации, три слота весов слоя, три буфера кусков головы, кольцо входов слоёв и
 активации текущего слоя. Пик всегда приходится на обучение, и его держит потолок шага (см. ниже).
@@ -479,7 +481,7 @@ nvidia-smi со счётчиками PyTorch внутри процесса.
   квантует в NF4 на одном GPU на fp16-пути Soup;
 - `peft.prepare_model_for_kbit_training` - эмбеддинг Qwen2 остаётся в fp16;
 - `SFTTrainerWrapper.train` - если модель распознана и это fp16-путь Soup на GPU sm_70+ (класс
-  T4; условие ниже), подменяет `compute_loss` тренера. Новый
+  T4; условие ниже), подменяет `compute_loss` тренера и ставит стек потоков CUDA 16 байт. Новый
   `compute_loss` делает ту же бухгалтерию, что HF `Trainer` + TRL `SFTTrainer` + rewind-рекордер
   Soup: нормировка loss по `num_items_in_batch`, `entropy` по всем реальным токенам, `num_tokens`,
   `mean_token_accuracy` по токенам ответа, строки `rewind.jsonl` с loss каждой строки;
@@ -601,6 +603,7 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | Входы слоёв и выходы `[gate \| up]` для backward в pinned-памяти CPU (`InputStream`, `GuStream`) | тот же README шаблона: "recomputation or offloading in your own code (its time counts)"; панель 44:10-44:48 - запрещён только встроенный в Soup `activation_offloading`, мы его не включаем и не вызываем; панель 10:52, 55:42 - хранить активации иначе и восстанавливать их в backward можно; свой CPU offloading с копиями внутри замера - [t.me/souptasterschat/834](https://t.me/souptasterschat/834). Значения не меняются (копии без преобразований), аллокатор не настраивается |
 | NF4-веса слоёв в pinned-памяти CPU с подкачкой на GPU, на хост - сразу после квантования при загрузке | "собственный CPU offloading" замороженных весов - разрешён ([t.me/souptasterschat/834](https://t.me/souptasterschat/834)); перенос `Params4bit.data` на CPU после сборки модели - "да" ([t.me/souptasterschat/1535](https://t.me/souptasterschat/1535)); квантование - тот же код bitsandbytes, байты те же, меняется только место хранения ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)) |
 | Эмбеддинг / `lm_head` весь прогон в pinned-памяти CPU, голова стримится на GPU кусками каждый шаг | прямо этот случай: замороженные `embed_tokens` / `lm_head` в pinned-памяти на весь прогон с подкачкой головы кусками - "собственный CPU offloading", время копий входит в замер ([t.me/souptasterschat/834](https://t.me/souptasterschat/834)); вычисления в fp16, как у базы под autocast ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)); закрепление памяти на месте через `cudaHostRegister` - тот же pinned-вес, а не настройка аллокатора |
+| Стек потоков CUDA 16 байт (`cudaDeviceSetLimit(cudaLimitStackSize, 16)` при установке шага) | прямо этот вопрос в чате ([t.me/souptasterschat/2037](https://t.me/souptasterschat/2037)) - "да" ([t.me/souptasterschat/2039](https://t.me/souptasterschat/2039)). Это резерв стека потоков контекста CUDA, а не аллокатор PyTorch и не гиперпараметр; драйвер сам поднимает лимит ядру, которому нужно больше, значения те же (тест) |
 | Эмбеддинг / `lm_head` хранятся только в fp16 | панель 58:22-58:38; [t.me/souptasterschat/620](https://t.me/souptasterschat/620): можно, если меняется только хранение, а значения и dtype в вычислениях те же - у нас значения побитно те же |
 | Патч загрузчика transformers (куда класть веса при загрузке) | патчи transformers в `apply()` - панель 43:04 ("через apply можно подменять код модели и операции"); значения весов и вся остальная загрузка те же, `hf_device_map` и dispatch модели не меняются; встроенный в Soup `activation_offloading` и другие его режимы не используются |
 | Свой расчёт loss, entropy, accuracy, loss строк и запись их в лог TRL и `rewind.jsonl` | README шаблона: "keep them with the same values (you may compute them faster)"; панель 26:24, 52:12-52:26 (готовую реализацию Soup вызывать нельзя, свой расчёт - можно); маски каждой метрики как у базы ([t.me/souptasterschat/576](https://t.me/souptasterschat/576)); проверка 5 |
@@ -611,7 +614,7 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 Чего мы не делаем: не включаем режимы Soup (`use_cut_ce`, `use_liger`, `gradient_checkpointing`,
 `activation_offloading`...) и не вызываем их внутренние реализации; не используем внешние
 кернел-библиотеки; не запускаем отдельных процессов; не храним ничего между запусками; не меняем
-аллокатор; не пишем в `sys.modules`; не завершаем процесс через `os._exit`; не ведём себя иначе
+аллокатор PyTorch (лимит стека CUDA - не он, см. таблицу); не пишем в `sys.modules`; не завершаем процесс через `os._exit`; не ведём себя иначе
 под замером (патч срабатывает по типу модели, а не по окружению). int8-GEMM организаторы разрешили
 ([t.me/souptasterschat/1587](https://t.me/souptasterschat/1587)), но мы его не взяли - см. эксперименты.
 
@@ -712,6 +715,7 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | `OFFLOAD_WEIGHTS` | `True` | подкачка NF4-весов из pinned-памяти CPU в шаге; `False` - веса на GPU (до выгрузок при загрузке пик был 1 761 MiB против 1 385, цикл тот же) |
 | `OFFLOAD_ACTIVATIONS` | `True` | входы слоёв для backward в pinned-памяти CPU (`InputStream`); `False` - на GPU (loss и градиенты побитно те же, пик выше) |
 | `OFFLOAD_GU` | `True` | выходы `[gate \| up]` в pinned-памяти CPU вместо пересчёта в backward (`GuStream`); `False` - пересчёт (loss и градиенты побитно те же; на Kaggle медленнее на ~2 с, на машине с медленной шиной, как Brev, быстрее на ~5 с) |
+| `CUDA_STACK_BYTES` | 16 | стек потоков CUDA в байтах на поток (`cudaDeviceSetLimit`): резерв контекста 40 MiB -> <1 MiB; `None` - значение CUDA по умолчанию (1 KiB) |
 | `STEP_CAP_MIB` | 420 | потолок памяти шага (MiB allocated), под которым шаг хранит активации вместо пересчёта; `None` - расчётный от пика загрузки (591 на T4) |
 | `KEEP_MARGIN` | 112 MiB | только при `STEP_CAP_MIB = None`: запас под расчётным потолком на фрагментацию аллокатора и модули CUDA, которые подгружаются во время обучения (с 64 MiB пик T4 выходил на 36 MiB выше) |
 | `EXTRA_MEMORY_MIB` | 0 | только при `STEP_CAP_MIB = None`: сколько MiB шаги могут занять сверх расчётного потолка под хранение активаций вместо пересчёта (обмен памяти на скорость) |
@@ -745,9 +749,11 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
   пересчёта - loss и градиенты LoRA побитно как с пересчётом, с весами, головой и входами слоёв на
   хосте, на двух шагах подряд; на 2 и 7 слоях, кольцо из 1 и 2 слотов, часть слоёв держит
   `[gate | up]` на GPU.
+- `solution/test_host_head.py::test_cuda_stack_limit_leaves_the_kernels_alone`: со стеком потоков
+  CUDA 16 байт лимит держится, а cuBLAS, attention и `lm_head_ce_kernel` дают те же значения.
 - 79 тестов Soup с нашими патчами (`SOUP_APPLY_SOLUTION=1`).
 
-Всего в `solution/` 50 тестов (с параметрами). На T4 `pytest solution` со свежим `TRITON_CACHE_DIR`
+Всего в `solution/` 51 тест (с параметрами). На T4 `pytest solution` со свежим `TRITON_CACHE_DIR`
 прошёл 3 раза подряд, 50 passed (`03f3cb6`). Пороги fp16 подобраны под T4, где два теста раньше
 падали только на этой карте (`42c35e5`, `af4857b`).
 
@@ -843,8 +849,8 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
   хэш токенизатора в `datasets.map` (2,1 с, fingerprint трогать нельзя), ленивая загрузка ~78
   модулей CUDA кернелов PyTorch в первом шаге (~0,4 с) и завершение интерпретатора (~1,7 с, у базы
   1,72 с). На машинах с быстрым CPU (Brev) время вне цикла у нас и у базы почти одинаковое.
-- **Дальше ~637 MiB пик опускается плохо.** ~170 MiB - вне аллокатора PyTorch (CUDA-контекст,
-  модули кернелов и cuBLAS), ещё ~150 MiB - слоты весов слоя и буферы кусков головы, остальное -
+- **Дальше ~600 MiB пик опускается плохо.** ~130 MiB - вне аллокатора PyTorch (CUDA-контекст,
+  модули кернелов и cuBLAS, уже со стеком потоков 16 байт), ещё ~150 MiB - слоты весов слоя и буферы кусков головы, остальное -
   кольца и активации шага под потолком 420 MiB allocated. Потолок 340 давал 555 MiB (до
   `[gate | up]` на хосте), но цикл дороже на 0,5 с, а ниже 555 экономный шаг не опускается.
 - **Выгрузки зависят от шины.** Каждый шаг гоняет по PCIe голову (445 MiB), входы слоёв (~135 MiB в
