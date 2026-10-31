@@ -101,9 +101,9 @@ def _to_host(model, name, param):
     device = param.device
     param.data = param.data.cpu()
     state.absmax = state.absmax.cpu()
-    # the freed GPU copies (and the fp16 tensor quantized from) go back to the driver: otherwise
-    # the allocator's cache of them grows with the load and the reservation peaks anyway
-    torch.cuda.empty_cache()
+    # (no empty_cache() here: with the harness's expandable segments the next weight reuses the
+    # freed GPU copies and the reservation stays at its load size, while one call per weight
+    # synchronized the device 196 times; WeightStream empties the cache once at install)
     _ON_HOST.append((module, device))
     module._apply = types.MethodType(_held_apply, module)
 
