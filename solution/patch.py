@@ -43,8 +43,12 @@ OFFLOAD_ACTIVATIONS = True
 # ~5 s slower
 OFFLOAD_GU = True
 # and those layers' q, k, v, attention output and o_proj output (engine.AttnStream): their
-# backward recomputes only the two RMSNorms, not the qkv / o GEMMs, RoPE and the attention
+# backward recomputes only the two RMSNorms, not the qkv / o GEMMs, RoPE and the attention;
+# only where host-to-GPU copies run at ATTN_MIN_GBPS or more (measured once, _h2d_gbps): its
+# ~10 KiB per token and layer each way fit beside the weights and [gate | up] on a T4's PCIe
+# 3.0 x16 bus (~12 GB/s, Kaggle), not on a host with half of it (~6.3 GB/s, Brev: +4 s)
 OFFLOAD_ATTN = True
+ATTN_MIN_GBPS = 9.0
 # put each NF4 layer weight in host memory right after the loader quantizes it
 # (solution/hostload.py); the fused step then streams them, so it requires OFFLOAD_WEIGHTS
 HOST_NF4_AT_LOAD = True
@@ -69,6 +73,29 @@ STEP_CAP_MIB = 420
 # kernel that needs more. Allowed by the organizers (t.me/souptasterschat/2039). None: CUDA's
 # default.
 CUDA_STACK_BYTES = 16
+
+
+def _h2d_gbps(engine):
+    """Host-to-GPU copy speed of this machine in GB/s, measured once: 4 x 16 MiB from the pinned
+    NF4 weights (WeightStream's host buffer) after one copy to warm up."""
+    gbps = getattr(engine, "_soup_h2d_gbps", None)
+    if gbps is None:
+        n = 16 * 2**20
+        src = engine.stream.host[:n]
+        dst = torch.empty((src.numel(),), dtype=torch.uint8, device=engine.device)
+        dst.copy_(src, non_blocking=True)
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(4):
+            dst.copy_(src, non_blocking=True)
+        end.record()
+        end.synchronize()
+        gbps = 4 * n / (start.elapsed_time(end) * 1e-3) / 1e9
+        engine._soup_h2d_gbps = gbps
+        del dst
+        _log(f"host-to-GPU copies at {gbps:.1f} GB/s: attention tensors "
+             f"{'in host memory' if gbps >= ATTN_MIN_GBPS else 'recomputed'} in backward")
+    return gbps
 
 
 def _restore_callback_base():
@@ -275,8 +302,13 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         engine.offload_inputs()
     if OFFLOAD_GU:
         engine.offload_gus()
-        if OFFLOAD_ATTN:
-            engine.offload_attns()
+        if OFFLOAD_ATTN and engine.attns is None and engine.stream is not None:
+            if _h2d_gbps(engine) >= ATTN_MIN_GBPS:
+                engine.offload_attns()
+            else:
+                from .engine import AttnStream
+
+                AttnStream.pages = None  # (faulted in by warmup.py for nothing)
     from .engine import UnsupportedBatch
 
     try:
