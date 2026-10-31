@@ -1,17 +1,22 @@
-"""How the fused step plugs into Soup: patches of `SFTTrainerWrapper.setup` / `.train` and of
-peft's `prepare_model_for_kbit_training`.
+"""How the fused step plugs into Soup (`patch_soup`, called by `solution.apply()`):
 
-- `setup`: starts compiling our kernels in the background (solution/warmup.py) while Soup
-  loads the model;
+- `patch_library_overheads`: `importlib.metadata.packages_distributions()` computed once;
+- `patch_weight_conversion`: the checkpoint's bf16 tensors converted to fp16 on the GPU at load;
+- `offload.patch_model_loading` / `hostload.patch_model_loading`: the embedding / lm_head and the
+  NF4 layer weights left in host memory by the loader;
 - `prepare_model_for_kbit_training`: leaves the frozen, tied embedding / lm_head of a Qwen2 in
-  its fp16 load dtype instead of upcasting it to fp32 (933 MiB instead of 467, and a 1.4 GiB
-  transient during the cast). Our step reads it in fp16 exactly as the base does: the base's
-  fp32 embedding rows are exact copies of fp16 values, and its lm_head runs in fp16 under
-  autocast. If the fused step is not installed after all, the fp32 copy is restored;
-- `train`: when the trainer and the 4-bit PEFT model exist and are the ones we know (Qwen2 +
-  bitsandbytes NF4 + LoRA on q/v projections), we replace the trainer's `compute_loss` with `fused_compute_loss`, which runs `FusedQwen2.step`
-  and then does exactly the bookkeeping HF Trainer, TRL's SFTTrainer and Soup's rewind recorder
-  do in theirs (same loss normalization, same logged metrics, same rewind rows).
+  its fp16 load dtype instead of upcasting it to fp32 (890 MiB instead of 445, and 1.3 GiB at
+  once during the cast). Our step reads it in fp16 exactly as the base does: the base's fp32
+  embedding rows are exact copies of fp16 values, and its lm_head runs in fp16 under autocast.
+  If the fused step is not installed after all, the fp32 copy is restored;
+- `SFTTrainerWrapper.setup`: starts the kernel warm-up (solution/warmup.py) if `apply()` could
+  not start it from the command line;
+- `SFTTrainerWrapper.train`: when the trainer and the 4-bit PEFT model exist and are the ones we
+  know (Qwen2 + bitsandbytes NF4 + LoRA on q/v projections), we replace the trainer's
+  `compute_loss` with `fused_compute_loss`, which runs `FusedQwen2.step` and then does exactly
+  the bookkeeping HF Trainer, TRL's SFTTrainer and Soup's rewind recorder do in theirs (same loss
+  normalization, same logged metrics, same rewind rows); `_walk_model_once` takes the trainer's
+  per-step walks over the model's modules once.
 Anything we do not recognize falls through to the original code untouched.
 """
 
@@ -36,12 +41,14 @@ OFFLOAD_ACTIVATIONS = True
 # 6b1cc09, 3 warm pairs: 1.7-2.6 s faster, peak the same; on a Brev T4, with half the bus,
 # ~5 s slower
 OFFLOAD_GU = True
-# put each NF4 layer weight in host memory right after the loader quantizes it (solution/hostload.py)
+# put each NF4 layer weight in host memory right after the loader quantizes it
+# (solution/hostload.py); the fused step then streams them, so it requires OFFLOAD_WEIGHTS
 HOST_NF4_AT_LOAD = True
-# Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
-# allocates, a long step makes the allocator's reservation grow (fragmentation) and CUDA modules
-# load during training; with 64 MiB a T4 run peaked 36 MiB above the load peak, with 112 MiB it
-# stays at it, at no measurable cost in time (an empty_cache() per step instead cost ~6%).
+# KEEP_MARGIN and EXTRA_MEMORY_MIB are used only with STEP_CAP_MIB = None (the step cap then
+# comes from the model-load peak). KEEP_MARGIN: bytes kept free under the model-load peak when a
+# step decides what to keep; beyond what PyTorch allocates, a long step makes the allocator's
+# reservation grow (fragmentation) and CUDA modules load during training (64 MiB was too little
+# on a T4, 112 MiB kept the run at the load peak).
 KEEP_MARGIN = 112 * 2**20
 # Memory the steps may use above the model-load peak to keep activations instead of recomputing
 # them (0: the run's peak stays the model load).
@@ -166,8 +173,11 @@ def patch_prepare_kbit():
         weight = None
         try:
             config = getattr(model, "config", None)
-            embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings")                 else None
-            if getattr(config, "model_type", None) == "qwen2" and embed is not None                     and getattr(model, "is_loaded_in_4bit", False)                     and embed.weight.dtype == torch.float16:
+            embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") \
+                else None
+            if getattr(config, "model_type", None) == "qwen2" and embed is not None \
+                    and getattr(model, "is_loaded_in_4bit", False) \
+                    and embed.weight.dtype == torch.float16:
                 weight = embed.weight
         except Exception:  # noqa: BLE001
             weight = None
@@ -383,10 +393,9 @@ def install(trainer, seed=0):
     causal = model.get_base_model()
     fp16_embedding = _embedding_to_fp16(causal)
     engine = FusedQwen2(model, seed=seed)
-    # The run's GPU memory peak so far is the model load. Steps may use memory below it (minus a
-    # margin for allocator slack) to keep activations instead of recomputing them. NF4 weights
-    # the loader put in host memory count as if they had been loaded to the GPU: the steps keep
-    # the room they had (the run's peak becomes theirs, ~60 MiB under the old load peak on a T4).
+    # With STEP_CAP_MIB = None the step cap comes from the model-load peak: steps may use memory
+    # below it (minus KEEP_MARGIN for allocator slack) to keep activations instead of recomputing
+    # them; NF4 weights the loader put in host memory count as if they had been loaded to the GPU.
     load_peak = torch.cuda.max_memory_allocated(engine.device)
     if engine.weights_on_host():
         load_peak += engine.nf4_bytes()
@@ -422,18 +431,15 @@ def patch_library_overheads():
     the Kaggle image, and nothing caches it). transformers calls it at import and keeps the
     result in `PACKAGE_DISTRIBUTION_MAPPING`; trl's import calls it again. Later callers get a
     fresh copy of a snapshot of that same mapping.
-
-    (A random `new_fingerprint` for in-memory `datasets.Dataset.map` was dropped: the organizers
-    count it as a change of the data, t.me/souptasterschat/1548.)
     """
     import importlib.metadata as metadata
 
     if not getattr(metadata.packages_distributions, "_soup_kernels_patched", False):
+        original_packages_distributions = metadata.packages_distributions
         computed = []
 
         def packages_distributions():
             if not computed:
-                mapping = None
                 module = sys.modules.get("transformers.utils.import_utils")
                 mapping = getattr(module, "PACKAGE_DISTRIBUTION_MAPPING", None)
                 if not isinstance(mapping, dict):
@@ -443,7 +449,6 @@ def patch_library_overheads():
                 computed.append({name: list(dists) for name, dists in mapping.items()})
             return {name: list(dists) for name, dists in computed[0].items()}
 
-        original_packages_distributions = metadata.packages_distributions
         packages_distributions._soup_kernels_patched = True
         metadata.packages_distributions = packages_distributions
 
