@@ -17,15 +17,12 @@ def apply():
     startup.exit_without_teardown()  # at the end: every exit handler, then os._exit (startup.py)
     startup.import_bitsandbytes()  # before peft imports it, see solution/startup.py
     startup.import_without_sklearn()
-    from .patch import patch_soup
-
-    patch_soup()
-    # compile our kernels in the background from here on, while Soup sets up and loads the model:
-    # started earlier, its Python work held the GIL against the imports above (Kaggle: apply()
-    # ~0.5 s longer), and it still ends before the first step needs it
-    try:
+    try:  # compile our kernels in the background from now on, while Soup imports and sets up
         from . import warmup
 
         warmup.start_from_command_line(sys.argv)
     except Exception as exc:  # noqa: BLE001 - a missed warm-up only costs time
         print(f"[solution] early kernel warm-up not started ({exc})", file=sys.stderr, flush=True)
+    from .patch import patch_soup
+
+    patch_soup()
