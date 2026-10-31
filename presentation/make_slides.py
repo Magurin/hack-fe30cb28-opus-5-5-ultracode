@@ -205,22 +205,24 @@ def s7_waterfall(fig):
     steps = [("база", 14345, BASE), ("слитый шаг\nбез паддинга*", 3355, LIGHT),
              ("пересчёт\nслоя*", 1468, LIGHT), ("NF4-веса\nна CPU", 1385, ACCENT),
              ("слоты после\nосвобождения", 1275, ACCENT), ("NF4 на хост\nпри загрузке", 1233, ACCENT),
-             ("эмбеддинг /\nlm_head на CPU", 813, ACCENT), ("входы слоёв\nна CPU", 735, ACCENT),
-             ("потолок шага\n420 MiB", 635, ACCENT), ("[gate | up]\nна CPU (Kaggle)", 639, ACCENT)]
+             ("голова\nна CPU", 813, ACCENT), ("входы слоёв\nна CPU", 735, ACCENT),
+             ("потолок шага\n420 MiB", 635, ACCENT), ("[gate | up]\nна CPU (Kaggle)", 639, ACCENT),
+             ("стек CUDA\n16 байт", 599, ACCENT)]
     xs = range(len(steps))
     ax.bar(xs, [v for _, v, _ in steps], color=[c for _, _, c in steps], width=0.7)
     ax.set_yscale("log")
     ax.set_ylim(400, 25000)
-    ax.set_xticks(list(xs), [n for n, _, _ in steps], fontsize=10)
+    ax.set_xticks(list(xs), [n for n, _, _ in steps], fontsize=9)
     for x, (_, v, _) in zip(xs, steps):
-        ax.text(x, v * 1.08, ru(v), ha="center", fontsize=12, weight="bold" if x in (0, 9) else None)
+        ax.text(x, v * 1.08, ru(v), ha="center", fontsize=12, weight="bold" if x in (0, len(steps) - 1) else None)
     ax.set_ylabel("пик, MiB (лог. шкала)")
     ax.set_title("Пик памяти GPU по шагам работы (nvidia-smi; * - allocated на RTX 4060)", fontsize=14, loc="left")
-    y = para(fig, 0.05, 0.24, "На GPU нет ни одного замороженного веса целиком и ни одного отложенного входа "
+    y = para(fig, 0.05, 0.265, "На GPU нет ни одного замороженного веса целиком и ни одного отложенного входа "
              "слоя: нормы, LoRA, 3 слота весов слоя, 3 буфера головы, кольца и активации текущего слоя.",
              115, size=13)
     para(fig, 0.05, y - 0.015, "Шаг сам прогнозирует свой пик и тратит запас под потолком 420 MiB на хранение "
-         "вместо пересчёта. Пик не зависит от данных: 617-639 MiB на срезах, 613-617 на батчах 4 x 512.",
+         "вместо пересчёта. Пик не зависит от данных (Brev, со стеком CUDA): 597-599 MiB на публичных, "
+         "579-599 на хвосте с длинными батчами, 573 на батчах 4 x 512.",
          115, size=13)
 
 
@@ -240,8 +242,8 @@ def s8_results(fig):
     fig.text(0.05, 0.30, "Kaggle T4, --repeats 2 (база, решение, решение, база), 3d06a30;\n"
              "медиана - запуск 1. Сессии Kaggle различаются (база 79-88 с):\nнаши r2 - 1,598-1,712x.",
              fontsize=12, color=MUTED, linespacing=1.4, va="top")
-    para(fig, 0.05, 0.17, "Срезы, похожие на скрытые (Brev T4): 10/10 проверок, пик 617-639 MiB; на "
-         "батчах 4 x 512 база падает с OOM, решение - 613-617 MiB.", 62, size=12)
+    para(fig, 0.05, 0.17, "Срезы, похожие на скрытые (Brev T4): 10/10 проверок; со стеком CUDA пик "
+         "579-599 MiB; на батчах 4 x 512 база падает с OOM, решение - 573 MiB.", 62, size=12)
     ax = fig.add_axes([0.56, 0.20, 0.38, 0.52])
     versions = [3, 4, 5, "6-8", 9, 10, 11, 12, 13, 14]
     s = [1.42, 1.53, 1.57, 1.56, 1.60, 1.61, 1.624, 1.628, 1.705, 1.712]
@@ -264,8 +266,9 @@ def s8_results(fig):
 
 def s9_failed(fig):
     bullets(fig, ["Свой GEMM на Triton: tl.dot на sm_75 без тензорных ядер - ~1 TFLOPS против 16-34 у cuBLAS.",
-                  "int8-GEMM (разрешён): на T4 лишь -15..-30% на части форм; down_proj в int8 даёт первый loss "
-                  "+2,3% при допуске 1%.",
+                  "int8-GEMM (разрешён): в forward [gate | up] - первый loss до 1,29% при допуске 1%; только в "
+                  "backward - точность как у fp16 и -58 MiB, но на Kaggle медленнее на 1,6-2,3 с (квантизация "
+                  "упирается в медленный CPU).",
                   "Загрузка модели в фоновом потоке: 54,8 с против 54,3 - Python-код загрузки делит GIL.",
                   "CUDA Graphs: длина батча меняется каждый шаг, корзины стоят 3-7% лишних GEMM.",
                   "Голова с резидентными на GPU кусками (4 и 8 по 24 MiB): цикл не быстрее, пик выше.",
