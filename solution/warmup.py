@@ -159,8 +159,10 @@ def _run(dims, dropout_p):
     values = dims["L"] * H * (HQ * D + 2 * HKV * D + HQ * D + 3 * I)
     pinned = torch.empty((values // 2 + values // 64,), dtype=torch.uint8, pin_memory=True)
     del pinned
-    # ... and the embedding / lm_head weight (engine.HostHead), if the loader leaves it on the CPU
-    pinned = torch.empty((V, H), dtype=f16, pin_memory=True)
+    # ... and the layer inputs' (engine.InputStream). The embedding / lm_head weight needs none:
+    # engine.HostHead pins it where the loader left it.
+    pinned = torch.empty((dims["L"], E.InputStream.HOST_ROWS, H), dtype=torch.float32,
+                         pin_memory=True)
     del pinned
 
 

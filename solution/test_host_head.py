@@ -260,6 +260,26 @@ def test_host_head_after_training_forward(tmp_path):
     assert torch.equal(before, after)
 
 
+def test_host_head_pins_embedding_in_place(tmp_path):
+    """An embedding the loader left in pageable host memory is pinned where it is (no copy), and
+    unregistered when it goes back to the GPU."""
+    from solution.engine import FusedQwen2
+    from solution.patch import _embedding_to_fp16
+
+    model = _tiny_model(tmp_path, dropout=0.0)
+    assert _embedding_to_fp16(model.get_base_model())
+    embed = model.get_base_model().model.embed_tokens.weight
+    before = embed.detach().clone()
+    embed.data = embed.data.cpu()  # as solution/offload leaves it
+    ptr = embed.data_ptr()
+    engine = FusedQwen2(model)
+    assert engine.offload_head()
+    assert embed.data_ptr() == ptr and embed.is_pinned()
+    engine.restore_head()
+    assert embed.is_cuda and torch.equal(embed.detach(), before)
+    assert engine.registered is None
+
+
 @pytest.mark.parametrize("slots,cap,layers", [(1, None, 2), (2, None, 2), (1, 1 << 40, 2),
                                                (3, None, 7), (3, 1 << 40, 7)])
 def test_layer_inputs_in_host_memory_are_exact(tmp_path, monkeypatch, slots, cap, layers):

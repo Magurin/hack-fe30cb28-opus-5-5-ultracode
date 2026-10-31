@@ -285,6 +285,7 @@ class InputStream:
     SLOTS = 3  # > LOOKAHEAD: a slot fetched into is never the one the backward reads
     LOOKAHEAD = 2
     ROWS = 256  # the ring grows (rarely) in steps of this many tokens
+    HOST_ROWS = 2048  # tokens the host buffer is first made for (warmup.py pins its block early)
 
     def __init__(self, layers, device):
         self.L, self.device = layers, device
@@ -301,7 +302,7 @@ class InputStream:
     def begin(self, n, H):
         if self.host is None or self.host.shape[1] < n:
             torch.cuda.synchronize(self.device)  # nothing still reads the old buffer
-            self.host = torch.empty((self.L, max(n, 2048), H), dtype=torch.float32,
+            self.host = torch.empty((self.L, max(n, self.HOST_ROWS), H), dtype=torch.float32,
                                     pin_memory=True)
         if self.ring is None or self.ring.shape[1] < n:
             torch.cuda.synchronize(self.device)
@@ -380,6 +381,22 @@ class InputStream:
         for j in range(1, min(self.LOOKAHEAD, self.SLOTS - 1) + 1):
             self.fetch(i - j)
         return out
+
+
+def _pin_in_place(t, device):
+    """Page-lock a contiguous CPU tensor's memory where it is (cudaHostRegister, as
+    torch.cuda._pin_memory_utils does) instead of copying it into a new pinned buffer: for the
+    445 MiB embedding 22 ms on a T4 host, against 45 ms for the copy alone. Returns whether it
+    did; the memory must be unregistered (cudaHostUnregister) before it is freed."""
+    if t.device.type != "cpu" or not t.is_contiguous() or t.is_pinned():
+        return False
+    rc = int(torch.cuda.cudart().cudaHostRegister(t.data_ptr(), t.numel() * t.element_size(), 0))
+    if rc != 0:
+        try:  # the failed call left its error as the runtime's last one; a launch check takes it
+            torch.zeros(1, device=device)
+        except RuntimeError:
+            pass
+    return rc == 0
 
 
 def _align(n, a=256):
@@ -1143,6 +1160,7 @@ class FusedQwen2:
                              for name in spec.base_modules]
         self.stream = None
         self.head = None  # a HostHead while the embedding / lm_head weight is in host memory
+        self.registered = None  # the embedding's host memory, if pinned where the loader put it
         self.inputs = None  # an InputStream while the layer inputs go to host memory
         self.embed_module = inner.embed_tokens
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
@@ -1266,7 +1284,9 @@ class FusedQwen2:
         weight = self.embed
         if weight.dtype != torch.float16 or self.lm_w is not weight:
             return False
-        if not weight.data.is_pinned():
+        if _pin_in_place(weight.data, self.device):  # where the loader put it (solution/offload)
+            self.registered = weight.data
+        elif not weight.data.is_pinned():
             host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
             host.copy_(weight.data)
             weight.data = host
@@ -1284,6 +1304,9 @@ class FusedQwen2:
         if self.embed.device != self.device:
             torch.cuda.synchronize(self.device)
             self.embed.data = self.embed.data.to(self.device)
+        if self.registered is not None:  # nothing reads it any more
+            torch.cuda.cudart().cudaHostUnregister(self.registered.data_ptr())
+            self.registered = None
         self.head = None
 
     def finish_training(self):
