@@ -87,6 +87,8 @@ def _patch_engine(E):
 
     def rms_fwd_rec(spec, x, weight, packed, **kw):
         res = rms_fwd(spec, x, weight, packed, **kw)
+        if getattr(spec, "index", None) is None:  # the warm-up's and the self-check's calls
+            return res
         seeds = kw.get("seeds", (0, 0))
         for which, out, s in (("q", res[2], seeds[0]), ("v", res[3], seeds[1])):
             if out is None or s in seen:
