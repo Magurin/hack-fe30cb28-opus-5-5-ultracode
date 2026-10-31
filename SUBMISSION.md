@@ -22,19 +22,19 @@ backward тоже ждут на хосте (последние - вместо п
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
-`3d06a30`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
+`aafb9a7`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
 | `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 7,8% |
 | `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,7% |
 | `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA, суммы градиентов | 1,3% |
-| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,86% |
+| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,88% |
 | `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,34% |
 | `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,1 + 2,0% |
 | `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,70 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **16,7%** (порог 5%) |
+| **Всего** | | | **16,8%** (порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -51,13 +51,13 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 85,3 | 49,8 | 1,712x speedup |
-| Training loop, 64 steps, s | 63,4 | 29,9 | 2,12x |
-| Peak GPU memory, MiB | 14 345 | 639 | 22,45x base/ours |
-| Eval loss (public rows) | 2,04965 | 2,04955 | -0,005% vs base |
+| Time of `soup train`, s (mean of 2 runs) | 84,6 | 49,8 | 1,698x speedup |
+| Training loop, 64 steps, s | 62,8 | 29,9 | 2,10x |
+| Peak GPU memory, MiB | 14 345 | 601 | 23,87x base/ours |
+| Eval loss (public rows) | 2,04965 | 2,04953 | -0,006% vs base |
 
-Коммит `3d06a30` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,905x / 22,45x -
-завышен холодной базой (94,6 с), опираемся на r2. Наши r2 в разных сессиях: 1,598-1,712x.
+Код `aafb9a7` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,952x / 23,87x -
+завышен холодной базой (95,5 с), опираемся на r2. Наши r2 в разных сессиях: 1,598-1,712x.
 
 - [x] All 10 checks of `harness/check_rules.py` passed: все 10 и в прогоне `--repeats 2`, и в
   шаблонном (проверка 10 - 79 тестов Soup passed)
@@ -65,14 +65,15 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 Дополнительно (Brev T4 - арендованные T4 с теми же версиями пакетов, не официальный замер): на
 публичных строках и на срезах, похожих на скрытые (другие строки, seed 3, 7, 29, 37, 71, 379),
-проверки проходят, пик 613-639 MiB (memory 22,4-23,4x), eval loss в пределах +-0,013%; на
-стресс-срезе из батчей 4 x 512 токенов база падает с OOM, решение проходит с пиком 613-617 MiB.
+проверки проходят, пик 613-639 MiB (memory 22,4-23,4x), со стеком CUDA 16 байт - 579-599 MiB, eval
+loss в пределах +-0,013%; на стресс-срезе из батчей 4 x 512 токенов база падает с OOM, решение
+проходит с пиком 573-617 MiB.
 Таблица - в README, раздел "Срезы, похожие на скрытые".
 
 ## Presentation covers
 Какие операции ускоряли и почему (паддинг, fp32-копии активаций, логиты на весь словарь, веса на
 GPU всё обучение), как устроены кернелы (деквантизация NF4 под Turing, слитые RMSNorm + LoRA,
-RoPE, SwiGLU, голова кусками словаря с online logsumexp), откуда 22x по памяти, результаты против базы (скорость,
+RoPE, SwiGLU, голова кусками словаря с online logsumexp), откуда 24x по памяти, результаты против базы (скорость,
 память, качество), ограничения и дальнейшие шаги.
 
 ## Limitations
