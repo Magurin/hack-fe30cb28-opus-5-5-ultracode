@@ -27,8 +27,8 @@ backward тоже ждут на хосте (последние - вместо п
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
 | `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 8,0% |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,8% |
-| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA, суммы градиентов | 1,3% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA (маска бит в бит как у базы) | 2,8% |
+| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA (те же маски), суммы градиентов | 1,3% |
 | `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,92% |
 | `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,36% |
 | `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,2 + 2,1% |
