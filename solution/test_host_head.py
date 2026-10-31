@@ -315,3 +315,43 @@ def test_layer_inputs_in_host_memory_are_exact(tmp_path, monkeypatch, slots, cap
     for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
         assert torch.equal(loss_a, loss_b)
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
+@pytest.mark.parametrize("slots,k_gu,layers", [(1, 0, 2), (2, 0, 2), (1, 1, 2), (2, 0, 7),
+                                               (2, 3, 7)])
+def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, layers):
+    """[gate | up] outputs kept in pinned host memory (GuStream) instead of recomputed in
+    backward give bit-identical loss and LoRA gradients, with the weights streamed and the head
+    and layer inputs on the host too, over two steps; also with the last layers keeping their
+    [gate | up] on the GPU (k_gu). With 7 layers the ring's slots are written again and the
+    backward fetches ahead."""
+    from solution.engine import FusedQwen2, GuStream
+    from solution.patch import _embedding_to_fp16
+
+    monkeypatch.setattr(GuStream, "SLOTS", slots)
+    monkeypatch.setattr(FusedQwen2, "layers_to_keep", lambda self, n: k_gu)
+    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(gu_on_host):
+        engine = FusedQwen2(model, seed=11)
+        engine.offload_weights()
+        engine.offload_head()
+        engine.offload_inputs()
+        if gu_on_host:
+            engine.offload_gus()
+        out = []
+        for ids, mask, labels in batches:
+            loss, packed, _ = engine.step(ids, mask, labels, 80.0)
+            assert (packed.gus is not None) == gu_on_host
+            assert not gu_on_host or packed.gus.upto == layers - k_gu
+            out.append((loss, torch.autograd.grad(loss, params)))
+        engine.restore_weights()
+        return out
+
+    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
+        assert torch.equal(loss_a, loss_b)
+        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))

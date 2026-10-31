@@ -269,41 +269,109 @@ class WeightStream:
         torch.cuda.synchronize(self.device)
 
 
-class InputStream:
-    """The input of every decoder layer (the fp32 residual, L x H x 4 bytes per token: the bulk
-    of what a step keeps for backward) waits in pinned host memory instead of on the GPU.
+class _HostRing:
+    """What InputStream and GuStream share: a tensor of each layer that waits in pinned host
+    memory (`host`, [L, rows, cols]) between the layer's forward and its backward, and a ring of
+    SLOTS device buffers it is written into and copied back into (layer i's in slot i % SLOTS).
 
-    The inputs live in a ring of SLOTS device buffers: layer i writes its output (the input of
-    layer i + 1) straight into slot (i + 1) % SLOTS, so the inputs never come from the caching
-    allocator (freed one by one between larger blocks, they fragmented its reservation). An
-    input is copied out on its own stream (a separate copy engine) while its layer computes; its
-    slot is written again SLOTS layers later, after the compute stream has waited for that copy.
-    The last SLOTS inputs are still in the ring when the backward starts and are used from there;
-    the others are copied back into their slot LOOKAHEAD layers ahead of the backward that reads
-    them (the slot's previous input belongs to a layer whose backward has already run)."""
+    A copy out runs on its own stream (a separate copy engine) while the layers compute on; a
+    slot is written again only after the compute stream has waited for the copy out of what it
+    held (`saved`), and read in backward after the copy back (`fetched`), so nothing needs
+    record_stream (which grew the allocator's reservation). The tensors of the last SLOTS layers
+    below `upto` are still in the ring when their backward runs; the others are copied back
+    LOOKAHEAD layers ahead of the backward that reads them, into a slot whose previous tensor
+    belongs to a layer whose backward has already run."""
 
-    SLOTS = 3  # > LOOKAHEAD: a slot fetched into is never the one the backward reads
-    LOOKAHEAD = 2
-    ROWS = 256  # the ring grows (rarely) in steps of this many tokens
+    SLOTS = 2
+    LOOKAHEAD = 1
     HOST_ROWS = 2048  # tokens the host buffer is first made for (warmup.py pins its block early)
 
     def __init__(self, layers, device):
         self.L, self.device = layers, device
         self.out_stream = torch.cuda.Stream(device)
         self.in_stream = torch.cuda.Stream(device)
-        self.host = None  # pinned [L, rows, H] fp32
-        self.ring = None  # [SLOTS, rows, H] fp32 on the device
+        self.host = None  # pinned [L, rows, cols]
+        self.ring = None  # [SLOTS, rows, cols] on the device
         self.saved = [torch.cuda.Event() for _ in range(layers)]
         self.fetched = [torch.cuda.Event() for _ in range(layers)]
-        self.first = None  # the first layer's input (not a ring slot), until its copy is done
-        self.in_slot = [None] * self.SLOTS  # which layer's input each slot holds
+        self.in_slot = [None] * self.SLOTS  # which layer's tensor each slot holds
         self.n = 0
+        self.upto = layers  # the layers below it use the ring
 
-    def begin(self, n, H):
+    def _host_rows(self, n, cols, dtype):
         if self.host is None or self.host.shape[1] < n:
             torch.cuda.synchronize(self.device)  # nothing still reads the old buffer
-            self.host = torch.empty((self.L, max(n, self.HOST_ROWS), H), dtype=torch.float32,
+            self.host = None
+            # one buffer: PyTorch hands out pinned memory in powers of two
+            self.host = torch.empty((self.L, max(n, self.HOST_ROWS), cols), dtype=dtype,
                                     pin_memory=True)
+
+    def _stays(self, i):
+        """Whether layer i's tensor is still in the ring when its backward runs."""
+        return i >= self.upto - self.SLOTS
+
+    def _slot(self, i):
+        """Forward: the slot layer i's tensor is written into."""
+        s = i % self.SLOTS
+        old = self.in_slot[s]
+        if old is not None and not self._stays(old):
+            torch.cuda.current_stream(self.device).wait_event(self.saved[old])  # copied out
+        self.in_slot[s] = i
+        return self.ring[s, :self.n]
+
+    def _copy_out(self, i, t):
+        """Forward: copy layer i's tensor t out once the compute stream has written it."""
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        self.out_stream.wait_event(ready)
+        with torch.cuda.stream(self.out_stream):
+            self.host[i, :self.n].copy_(t, non_blocking=True)
+            self.saved[i].record(self.out_stream)
+
+    def fetch(self, i):
+        """Backward: start copying layer i's tensor back into its slot."""
+        s = i % self.SLOTS
+        if i < 0 or self._stays(i) or self.in_slot[s] == i:
+            return
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))  # the slot's last reader is done
+        self.in_stream.wait_event(ready)
+        with torch.cuda.stream(self.in_stream):
+            self.ring[s, :self.n].copy_(self.host[i, :self.n], non_blocking=True)
+            self.fetched[i].record(self.in_stream)
+        self.in_slot[s] = i
+
+    def load(self, i):
+        """Backward of layer i: its tensor on the current stream; starts fetching the next
+        ones (never into the slot this backward reads: j < SLOTS)."""
+        if not self._stays(i):
+            self.fetch(i)
+            torch.cuda.current_stream(self.device).wait_event(self.fetched[i])
+        out = self.ring[i % self.SLOTS, :self.n]
+        for j in range(1, min(self.LOOKAHEAD, self.SLOTS - 1) + 1):
+            self.fetch(i - j)
+        return out
+
+
+class InputStream(_HostRing):
+    """The input of every decoder layer (the fp32 residual, L x H x 4 bytes per token: the bulk
+    of what a step keeps for backward) waits in pinned host memory instead of on the GPU.
+
+    Layer i writes its output (the input of layer i + 1) straight into slot (i + 1) % SLOTS, so
+    the inputs never come from the caching allocator (freed one by one between larger blocks,
+    they fragmented its reservation); its input is copied out while it computes. The first
+    layer's input (the embedding output) is not a slot: it is kept until its copy is done."""
+
+    SLOTS = 3  # > LOOKAHEAD: a slot fetched into is never the one the backward reads
+    LOOKAHEAD = 2
+    ROWS = 256  # the ring grows (rarely) in steps of this many tokens
+
+    def __init__(self, layers, device):
+        super().__init__(layers, device)
+        self.first = None  # the first layer's input (not a ring slot), until its copy is done
+
+    def begin(self, n, H):
+        self._host_rows(n, H, torch.float32)
         if self.ring is None or self.ring.shape[1] < n:
             torch.cuda.synchronize(self.device)
             self.ring = None
@@ -313,10 +381,6 @@ class InputStream:
         self.first = None
         self.in_slot = [None] * self.SLOTS
 
-    def _stays(self, i):
-        """Whether layer i's input is still in the ring when the backward reaches it."""
-        return i >= self.L - self.SLOTS
-
     def save(self, i, h):
         """Forward of layer i, before its compute: copy its input out (unless it stays in the
         ring). Returns whether the layer must not keep `h` for backward."""
@@ -325,62 +389,61 @@ class InputStream:
         if i == 0:
             self.first = h
         if not self._stays(i):
-            ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self.device))
-            self.out_stream.wait_event(ready)
-            with torch.cuda.stream(self.out_stream):
-                self.host[i, :self.n].copy_(h, non_blocking=True)
-                self.saved[i].record(self.out_stream)
+            self._copy_out(i, h)
         return True
 
     def output(self, i):
         """The slot layer i writes its output (layer i + 1's input) into, or None for the last
         layer (its output goes to the head)."""
-        j = i + 1
-        if j >= self.L:
+        if i + 1 >= self.L:
             return None
-        slot = j % self.SLOTS
-        current = torch.cuda.current_stream(self.device)
-        old = self.in_slot[slot]
-        if old is not None and not self._stays(old):
-            current.wait_event(self.saved[old])  # its copy out is done
+        slot = self._slot(i + 1)
         if self.first is not None and i >= 1:
-            current.wait_event(self.saved[0])
+            torch.cuda.current_stream(self.device).wait_event(self.saved[0])
             self.first = None
-        self.in_slot[slot] = j
-        return self.ring[slot, :self.n]
+        return slot
 
     def finish_forward(self):
-        current = torch.cuda.current_stream(self.device)
         if self.first is not None:
-            current.wait_event(self.saved[0])
+            torch.cuda.current_stream(self.device).wait_event(self.saved[0])
             self.first = None
 
-    def fetch(self, i):
-        """Start copying layer i's input back into its slot (backward)."""
-        if i < 0 or self._stays(i) or self.in_slot[i % self.SLOTS] == i:
-            return
-        slot = i % self.SLOTS
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(self.device))  # the slot's last reader is done
-        self.in_stream.wait_event(ready)
-        with torch.cuda.stream(self.in_stream):
-            self.ring[slot, :self.n].copy_(self.host[i, :self.n], non_blocking=True)
-            self.fetched[i].record(self.in_stream)
-        self.in_slot[slot] = i
 
-    def load(self, i):
-        """Layer i's input on the current stream (backward); starts fetching the next ones."""
-        if self._stays(i):
-            out = self.ring[i % self.SLOTS, :self.n]
-        else:
-            self.fetch(i)
-            torch.cuda.current_stream(self.device).wait_event(self.fetched[i])
-            out = self.ring[i % self.SLOTS, :self.n]
-        # (a slot fetched into must not be the one this backward reads: j < SLOTS)
-        for j in range(1, min(self.LOOKAHEAD, self.SLOTS - 1) + 1):
-            self.fetch(i - j)
-        return out
+class GuStream(_HostRing):
+    """The [gate | up] GEMM output (2 * I fp16 per token) of the layers below `upto` (those
+    that do not keep it on the GPU, FusedQwen2.keep_plan) waits in pinned host memory instead of
+    being recomputed in backward: that GEMM is most of the backward's recomputation.
+
+    The layers write their [gate | up] GEMM straight into their slot. The ring is sized to each
+    step's tokens and allocated before the step's plan, so the layers keeping [gate | up] on the
+    GPU are fewer by its size: their forward, with the whole ring allocated, is where a step
+    with the layer inputs in host memory peaks."""
+
+    def ring_bytes(self, n, cols):
+        return self.SLOTS * n * cols * 2
+
+    def release(self):
+        """Free the ring: the compute stream has waited for every copy into or out of it."""
+        self.ring = None
+
+    def begin(self, n, cols):
+        self._host_rows(n, cols, torch.float16)  # 2 GiB for 2048 tokens
+        self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
+        self.n = n
+        self.upto = 0
+        self.in_slot = [None] * self.SLOTS
+
+    def holds(self, i):
+        return i < self.upto
+
+    def slot(self, i):
+        """Forward of layer i: the buffer its [gate | up] goes into."""
+        return self._slot(i)
+
+    def save(self, i):
+        """Forward of layer i, after its [gate | up] GEMM: copy it out."""
+        if not self._stays(i):
+            self._copy_out(i, self.ring[i % self.SLOTS, :self.n])
 
 
 def _pin_in_place(t, device):
@@ -464,6 +527,7 @@ class Packed:
         self.keep_gu_from = 1 << 30  # layers from this index on keep [gate | up] for backward
         self.keep_all_from = 1 << 30  # ... and from this one every intermediate
         self.inputs = None  # an InputStream, if the layer inputs wait in host memory
+        self.gus = None  # a GuStream, if [gate | up] of the layers below gus.upto does
         self.lean = False  # recompute and run the MLP in parts (FusedQwen2.keep_plan)
         self.mlp_chunk = MLP_CHUNK
 
@@ -779,7 +843,13 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         del w, m
         return _layer_output(spec, packed, h2, d), None
     if gu is None:
-        gu = b @ w.t()
+        gus = packed.gus if not keep and packed.gus is not None \
+            and packed.gus.holds(spec.index) else None
+        if gus is None:
+            gu = b @ w.t()
+        else:  # into its GuStream slot, copied to host memory for the backward
+            gu = torch.mm(b, w.t(), out=gus.slot(spec.index))
+            gus.save(spec.index)
     del b
     if keep or full:
         saved.update(rstd1=rstd1, aq=aq, av=av, xq=xq, xv=xv, q=q, k_e=k_e, v_e=v_e,
@@ -873,10 +943,12 @@ class _Layer(torch.autograd.Function):
             if ctx.kept_all is not None:  # nothing to recompute; weights dequantized below
                 f, ctx.kept_all = ctx.kept_all, None
             else:
+                gu = ctx.kept_gu
+                if gu is None and packed.gus is not None and packed.gus.holds(spec.index):
+                    gu = packed.gus.load(spec.index)
                 with torch.no_grad():
-                    _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True,
-                                          gu=ctx.kept_gu)
-                ctx.kept_gu = None
+                    _, f = _layer_forward(spec, h, packed, lora16, seeds, keep=True, gu=gu)
+                ctx.kept_gu = gu = None
 
             # MLP
             gu = f.pop("gu")
@@ -1162,6 +1234,7 @@ class FusedQwen2:
         self.head = None  # a HostHead while the embedding / lm_head weight is in host memory
         self.registered = None  # the embedding's host memory, if pinned where the loader put it
         self.inputs = None  # an InputStream while the layer inputs go to host memory
+        self.gus = None  # a GuStream while [gate | up] outputs may go to host memory
         self.embed_module = inner.embed_tokens
         self.dropout_p = _lora_dropout(inner.layers[0], lora_names)
         self.norm_w = inner.norm.weight
@@ -1232,14 +1305,14 @@ class FusedQwen2:
         inputs = 0 if self.inputs is not None else n * L * H * 4
         return torch.cuda.memory_allocated(self.device) + work + inputs
 
-    def lean(self, n):
+    def lean(self, n, extra=0):
         """Whether a step of n tokens needs the lean recomputation to stay under the cap: on the
         longest batches (4 x 512 tokens) the plain step's peak (inputs of every layer plus one
         layer's [gate | up] output and dm) would go above the model-load peak. A lean step keeps
         nothing and recomputes in two parts (_layer_forward), with [gate | up] alive for
         MLP_CHUNK tokens at a time: ~205 KiB per token instead of ~250."""
         cap = getattr(self, "memory_cap", None)
-        return bool(cap) and n > self.mlp_chunk and self._predicted_peak(n) > cap
+        return bool(cap) and n > self.mlp_chunk and self._predicted_peak(n) + extra > cap
 
     def layers_to_keep(self, n):
         """How many layers can keep their [gate | up] output (2 * I fp16 values per token) instead
@@ -1299,6 +1372,12 @@ class FusedQwen2:
         if self.inputs is None:
             self.inputs = InputStream(len(self.layers), self.device)
 
+    def offload_gus(self):
+        """Keep the [gate | up] outputs of the layers that would recompute them in backward in
+        pinned host memory (GuStream)."""
+        if self.gus is None:
+            self.gus = GuStream(len(self.layers), self.device)
+
     def restore_head(self):
         """Put the embedding / lm_head weight back on the GPU."""
         if self.embed.device != self.device:
@@ -1333,6 +1412,8 @@ class FusedQwen2:
     def restore_weights(self):
         self.restore_head()
         self.inputs = None  # its device ring and pinned buffer (offload_inputs makes them again)
+        if self.gus is not None:
+            self.gus.release()  # its device ring (its pinned buffers stay for the next steps)
         if self.stream is not None:
             for spec in self.layers:
                 spec.stream = None
@@ -1349,11 +1430,23 @@ class FusedQwen2:
         if self.inputs is not None:  # before the plan: its device ring counts as allocated
             self.inputs.begin(packed.n, self.layers[0].H)
             packed.inputs = self.inputs
+        L = len(self.layers)
+        cols = 2 * self.layers[0].I
+        if self.gus is not None:
+            self.gus.release()
+            if self.layers_to_keep(packed.n) < L \
+                    and not self.lean(packed.n, self.gus.ring_bytes(packed.n, cols)):
+                # some layer would recompute its [gate | up], and with the ring (allocated
+                # before the plan) the step still needs no lean recomputation (it keeps nothing)
+                self.gus.begin(packed.n, cols)
+                packed.gus = self.gus
         k_gu, k_all = self.keep_plan(packed.n)
-        packed.keep_gu_from = len(self.layers) - k_gu
-        packed.keep_all_from = len(self.layers) - k_all
+        packed.keep_gu_from = L - k_gu
+        packed.keep_all_from = L - k_all
         packed.mlp_chunk = self.mlp_chunk
         packed.lean = k_gu == 0 and self.lean(packed.n)
+        if packed.gus is not None:
+            packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)

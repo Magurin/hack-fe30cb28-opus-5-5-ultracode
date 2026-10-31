@@ -31,6 +31,11 @@ OFFLOAD_WEIGHTS = True  # stream the NF4 layer weights from pinned host memory (
 OFFLOAD_HEAD = True
 # keep the layer inputs the backward needs in pinned host memory (engine.InputStream)
 OFFLOAD_ACTIVATIONS = True
+# keep the [gate | up] outputs a step would recompute in backward in pinned host memory instead
+# (engine.GuStream): the copies run on the PCIe bus beside the compute. Kaggle T4 A/B against
+# 6b1cc09, 3 warm pairs: 1.7-2.6 s faster, peak the same; on a Brev T4, with half the bus,
+# ~5 s slower
+OFFLOAD_GU = True
 # put each NF4 layer weight in host memory right after the loader quantizes it (solution/hostload.py)
 HOST_NF4_AT_LOAD = True
 # Bytes kept free under the model-load peak when a step decides what to keep. Beyond what PyTorch
@@ -216,6 +221,8 @@ def fused_compute_loss(self, model, inputs, return_outputs=False, num_items_in_b
         engine.restore_head()  # an embedding the loader left in host memory goes back
     if OFFLOAD_ACTIVATIONS:
         engine.offload_inputs()
+    if OFFLOAD_GU:
+        engine.offload_gus()
     from .engine import UnsupportedBatch
 
     try:
