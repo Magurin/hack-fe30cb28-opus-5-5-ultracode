@@ -259,7 +259,7 @@ r2 - `run_task.py --repeats 2`, как у жюри; "шаблон" - один з
 | 17 (`03b9441`) | длинные шаги хранят `[gate \| up]` на хосте кусками по 512 токенов вместо пересчёта | 1,729x (r2) / 1,884x (холодная база) | 23,87x |
 | 18 (`5f9b2ef`) | маски LoRA dropout бит в бит как у базы (тот же поток Philox от генератора CUDA), самопроверка на первом шаге | 1,728x (r2) / 1,791x (холодная база) | 23,87x |
 | 19 (`c4b156e`) | рабочая область cuBLAS `:16:8` (-20 MiB вне аллокатора) | 1,710x (r2, быстрая сессия) / 1,815x (холодная база) | 24,61x |
-| 20 (`8c584c0`) | своя токенизация строк без `datasets.map` (-2..-3 с вне цикла) | 1,824x (r2) / 2,061x (холодная база) | 24,61x |
+| 20 (`8c584c0`) | своя токенизация строк без `datasets.map` (-2..-3 с вне цикла; позже убрана - запрет [t.me/souptasterschat/4879](https://t.me/souptasterschat/4879)) | 1,824x (r2) / 2,061x (холодная база) | 24,61x |
 
 ### Срезы, похожие на скрытые (Brev T4, не официальный замер)
 
@@ -691,7 +691,6 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | 4. Фоновая компиляция не отнимает CPU у загрузки модели | `warmup.py`, `__init__.py` | nice 19, один поток компиляции с ранним стартом, лаунчеры с -O0 | nice: -0,6 с; один поток и ранний старт: -1,3 с; -O0: прогрев 8,7-9,7 -> 7,0-7,9 с |
 | 5. Обходы модели на границе шага по спискам, снятым один раз (`f2fd8a2`, `9b65cde`) | `patch.py`, `_walk_model_once` | тренер HF не обходит ~1 000 модулей 4 раза за шаг | цикл 25,72 -> 25,12 с, вся команда -0,75 с (Brev) |
 | 6. bf16 -> fp16 при загрузке модели - на GPU, а не на CPU (`777b83a`) | `patch.py`, `patch_weight_conversion` | конвертация чекпойнта идёт на GPU, биты те же | вне цикла 20,69 -> 19,34 с (Kaggle, 4 против 4) |
-| 7. Своя токенизация строк без `datasets.map` (`a008f6c`, `8c584c0`) | `dataprep.py`, `patch_tokenization` | те же `format_row` и проверка тех же строк, но без dill-хэша токенизатора | Kaggle A/B (2 аккаунта по 3 пары): вся команда -1,96..-3,27 с, цикл и пик те же |
 
 Подробно:
 
@@ -700,17 +699,20 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
    `PACKAGE_DISTRIBUTION_MAPPING`, импорт trl вызывает её ещё раз. Мы отдаём каждому следующему
    вызывающему собственную копию словаря transformers: результат тот же (пакеты во время запуска не
    ставятся), а изменения одного вызывающего не видны другим - условие из
-   [t.me/souptasterschat/592](https://t.me/souptasterschat/592).
+   [t.me/souptasterschat/592](https://t.me/souptasterschat/592); ещё раз подтверждено в
+   [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045) (п. 1).
 2. bitsandbytes оборачивает несколько CPU-путей в `torch.compile` и при импорте тянет TorchInductor
    (~150 модулей); на CUDA у каждой операции bnb свой кернел. Переменная читается только при вызове
    `torch.compile`, сразу после импорта мы возвращаем её прежнее значение; путь обучения, harness и
-   проверки не меняются. Разрешено: [t.me/souptasterschat/834](https://t.me/souptasterschat/834) (п. 4).
+   проверки не меняются. Разрешено: [t.me/souptasterschat/834](https://t.me/souptasterschat/834) (п. 4),
+   прямо этот патч - [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045) (п. 4).
 3. transformers импортирует sklearn в двух модулях ради функций, которых обучение не использует
    (подбор порога assisted generation, GLUE-метрики); trl импортирует wandb в трёх модулях, даже
    если Soup ни во что не логирует. Пока импортируются ровно эти модули, проверка доступности
    отвечает "нет", затем восстанавливается. Библиотеки просто не импортируются, как на машине без них.
    Разрешено: sklearn - [t.me/souptasterschat/622](https://t.me/souptasterschat/622) (п. 1), wandb и
-   другие ненужные импорты - [t.me/souptasterschat/2507](https://t.me/souptasterschat/2507) (п. 3); заглушек в `sys.modules`
+   другие ненужные импорты - [t.me/souptasterschat/2507](https://t.me/souptasterschat/2507) (п. 3), отложенные
+   импорты без `sys.modules` - ещё раз [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045) (п. 3); заглушек в `sys.modules`
    (запрещены, [t.me/souptasterschat/609](https://t.me/souptasterschat/609)) нет.
 4. На Kaggle 2 ядра x 2 потока, и компиляция Triton (LLVM, ptxas, gcc) отнимала CPU у загрузки
    модели: с прогревом она шла 6,1 с, без него 3,0 с (GIL ни при чём: py-spy `--gil`).
@@ -732,19 +734,6 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
    +8 MiB GPU на время куска, пик тот же. Только bf16 -> fp16 на CUDA, остальное - исходным кодом
    transformers. Основание - [t.me/souptasterschat/622](https://t.me/souptasterschat/622) (п. 1,
    ускорять подготовку до обучения можно); значения весов те же.
-7. Soup токенизирует строки как `Dataset.from_list(rows).map(checked_format_row, ...)`. Для датасета
-   в памяти `map` кэш-файл не пишет, но для отпечатка результата хэширует функцию через dill, а она
-   замыкает токенизатор: ~2,0 с на Brev и ~2,1 с на Kaggle из 2,6 с всего `map`, хотя сами 256 строк
-   форматируются за 0,45 с. Мы подменяем `_map_text_sft_rows` Soup: те же `format_row` и проверка
-   (`ensure_causal_loss_target` и та же `ValueError` с номером строки) на тех же строках в том же
-   порядке, затем `Dataset.from_list` результатов - те же колонки, типы и значения. Отпечаток
-   `datasets` мы не подменяем (от этого организаторы отказали, см. ниже), а не вызываем `map`
-   вовсе; хэши данных самого Soup (`dataset_fingerprint` в rewind - sha256 сырых строк, хэш файла
-   в `experiments.db`) не меняются. Всё необычное (лишние колонки, разные ключи у строк,
-   не-целочисленные колонки, пустой сплит) уходит в `map` Soup. Основание - прямо этот вопрос:
-   токенизировать датасет своим кодом (input_ids и labels побитно те же) и держать его в памяти
-   без записи кэша ([t.me/souptasterschat/2987](https://t.me/souptasterschat/2987), п. 4), ответ
-   "на все можно" ([t.me/souptasterschat/2989](https://t.me/souptasterschat/2989)).
 
 **Куда уходили ~21,7 с вне цикла** (Kaggle, код `b102d99`, до `777b83a`; py-spy по главному потоку,
 секунды пересчитаны на прогон без профилировщика, x 0,83 - оценка):
@@ -755,13 +744,13 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | `apply()`: импорт peft / transformers (тянет scipy и torchvision через лоссы детекции), bitsandbytes, trl / datasets / pandas, старт прогрева | 4,3 | без scipy / torchvision `apply()` на 0,36 с короче, но вне цикла не быстрее (A/B) - не взяли; остальное нужно |
 | Загрузка модели: чтение safetensors и копия на GPU | 3,4 | да: конвертация bf16 -> fp16 на GPU (патч выше, -1,35 с) |
 | Загрузка модели: квантование NF4 и перенос на хост, остальное `from_pretrained` | 1,3 | сделано: без `empty_cache()` на каждом из 196 весов, -0,34 с на Brev (`e32b8bd`) |
-| `datasets.map`: хэш функции через dill (токенизатор в замыкании) | 2,3 | подменять отпечаток запрещено ([t.me/souptasterschat/1548](https://t.me/souptasterschat/1548)), но своя токенизация без `map` разрешена ([t.me/souptasterschat/2989](https://t.me/souptasterschat/2989)) - сделано позже (патч 7, `a008f6c`) |
+| `datasets.map`: хэш функции через dill (токенизатор в замыкании) | 2,3 | нет: подменять отпечаток запрещено ([t.me/souptasterschat/1548](https://t.me/souptasterschat/1548)), своя токенизация без `map` и пропуск хэша токенизатора - тоже ([t.me/souptasterschat/4879](https://t.me/souptasterschat/4879), [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2); см. ниже |
 | `datasets.map`: токенизация строк, токенизатор, `get_peft_model`, прочий setup Soup | 2,6 | код Soup и данные - не трогаем |
 | Старт интерпретатора и выход | 1,2 | нет: `os._exit` запрещён ([t.me/souptasterschat/609](https://t.me/souptasterschat/609)), на gc-трюки организаторы ответили "Не думаю" ([t.me/souptasterschat/1447](https://t.me/souptasterschat/1447)) |
 | До первого шага, сохранение адаптера и токенизатора, метрики харнесса | 1,1 | код HF / Soup |
 
-Около 10 с из этого - харнесс, библиотеки и Soup, которые трогать нельзя или незачем (хэш
-`datasets.map` мы позже убрали своей токенизацией).
+Около 12 с из этого - харнесс, библиотеки и Soup (вместе с хэшем `datasets.map`), которые трогать
+нельзя или незачем.
 
 **От чего отказались: случайный `new_fingerprint` для `datasets.Dataset.map`.** Для датасета в
 памяти `map` хэширует функцию преобразования через dill только ради имени кэш-файла, который не
@@ -769,8 +758,16 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 допустили подмену fingerprint при условиях ([t.me/souptasterschat/592](https://t.me/souptasterschat/592)),
 но позже на такой же вопрос ответили, что это изменение данных
 ([t.me/souptasterschat/1548](https://t.me/souptasterschat/1548)). Мы убрали патч (`1f255db`):
-~2 с не стоят риска недопуска. Позже те же ~2 с мы вернули иначе - своей токенизацией без `map`
-(патч 7), на которую организаторы прямо ответили "можно".
+~2 с не стоят риска недопуска. Позже мы вернули те же ~2 с иначе - своей токенизацией без `map`
+(`a008f6c`, `8c584c0`; ответ "на все можно" -
+[t.me/souptasterschat/2989](https://t.me/souptasterschat/2989) на
+[t.me/souptasterschat/2987](https://t.me/souptasterschat/2987), п. 4), но на прямой вопрос о сборке
+датасета своей токенизацией через `Dataset.from_list` без `map` организаторы ответили "нет"
+([t.me/souptasterschat/4879](https://t.me/souptasterschat/4879) на
+[t.me/souptasterschat/4867](https://t.me/souptasterschat/4867)), а пропуск хэша токенизатора для
+отпечатка подпадает под прежний запрет обхода fingerprint
+([t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2). Патч убран (`4a103f0`,
+`7962b1d`): токенизирует снова `map` Soup (цифры - в "Что проверили и отвергли").
 
 ## Почему это по правилам
 
@@ -785,7 +782,7 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | Входы слоёв, выходы `[gate \| up]` и тензоры attention (q, k/v, выход attention, `o_proj`) для backward в pinned-памяти CPU (`InputStream`, `GuStream`, `AttnStream`) | тот же README шаблона: "recomputation or offloading in your own code (its time counts)"; панель 44:10-44:48 - запрещён только встроенный в Soup `activation_offloading`, мы его не включаем и не вызываем; панель 10:52, 55:42 - хранить активации иначе и восстанавливать их в backward можно; прямо этот случай - выгрузка промежуточных активаций в pinned RAM с теми же значениями и dtype, копии и синхронизации в замере, а также дополнительные CUDA streams и events для перекрытия копий с вычислениями - "да" ([t.me/souptasterschat/2101](https://t.me/souptasterschat/2101), ответ [t.me/souptasterschat/2103](https://t.me/souptasterschat/2103), п. 1-2). Значения не меняются (копии без преобразований), аллокатор не настраивается |
 | NF4-веса слоёв в pinned-памяти CPU с подкачкой на GPU, на хост - сразу после квантования при загрузке | прямо этот вопрос: держать замороженные веса (NF4-слои и fp16 эмбеддинг / `lm_head`) в pinned-памяти CPU и своим кодом подгружать их на GPU по ходу шага ([t.me/souptasterschat/1813](https://t.me/souptasterschat/1813)) - "можно как собственный offloading" ([t.me/souptasterschat/2519](https://t.me/souptasterschat/2519)); не резервировать память в `caching_allocator_warmup` при загрузке - разрешено ([t.me/souptasterschat/2875](https://t.me/souptasterschat/2875), ответ [t.me/souptasterschat/2880](https://t.me/souptasterschat/2880), п. 1); дополнительно: перенос `Params4bit.data` на CPU после сборки модели - "да" ([t.me/souptasterschat/1535](https://t.me/souptasterschat/1535)), у нас те же байты уходят раньше, при загрузке; отдельные CUDA streams для подкачки - "да" ([t.me/souptasterschat/2103](https://t.me/souptasterschat/2103), п. 2); квантование - тот же код bitsandbytes, байты те же, меняется только место хранения ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)) |
 | Эмбеддинг / `lm_head` весь прогон в pinned-памяти CPU, голова стримится на GPU кусками каждый шаг | прямо этот случай: замороженные `embed_tokens` / `lm_head` в pinned-памяти на весь прогон с подкачкой головы кусками - "собственный CPU offloading", время копий входит в замер ([t.me/souptasterschat/834](https://t.me/souptasterschat/834), п. 2; [t.me/souptasterschat/2519](https://t.me/souptasterschat/2519)); вычисления в fp16, как у базы под autocast ([t.me/souptasterschat/620](https://t.me/souptasterschat/620)); закрепление памяти на месте через `cudaHostRegister` - тот же pinned-вес, а не настройка аллокатора |
-| Стек потоков CUDA 16 байт (`cudaDeviceSetLimit(cudaLimitStackSize, 16)` при установке шага) | прямо этот вопрос в чате ([t.me/souptasterschat/2037](https://t.me/souptasterschat/2037)) - "да" ([t.me/souptasterschat/2039](https://t.me/souptasterschat/2039), п. 2). Это резерв стека потоков контекста CUDA, а не аллокатор PyTorch и не гиперпараметр; драйвер сам поднимает лимит ядру, которому нужно больше, значения те же (тест) |
+| Стек потоков CUDA 16 байт (`cudaDeviceSetLimit(cudaLimitStackSize, 16)` при установке шага) | прямо этот вопрос в чате ([t.me/souptasterschat/2037](https://t.me/souptasterschat/2037)) - "да" ([t.me/souptasterschat/2039](https://t.me/souptasterschat/2039), п. 2); ещё раз - [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 5. Это резерв стека потоков контекста CUDA, а не аллокатор PyTorch и не гиперпараметр; драйвер сам поднимает лимит ядру, которому нужно больше, значения те же (тест) |
 | Рабочая область cuBLAS `:16:8` (`CUBLAS_WORKSPACE_CONFIG`, если пользователь его не задал, и `CUBLASLT_WORKSPACE_SIZE` 128 KiB) первым делом в `apply()` | прямо этот вопрос - уменьшить рабочую область cuBLAS в `apply()` ([t.me/souptasterschat/2875](https://t.me/souptasterschat/2875), п. 4) - разрешено ([t.me/souptasterschat/2880](https://t.me/souptasterschat/2880): "кроме 8го все можно"). Это не аллокатор PyTorch: память области берёт сам cuBLAS. Честная оговорка: в вопросе было "матмулы те же", а на деле cuBLAS с меньшей областью для части GEMM выбирает другие алгоритмы, и они округляются иначе в последних битах; кривая loss против базы та же - в среднем 0,01%, максимум по шагам 0,05-0,08% |
 | Эмбеддинг / `lm_head` хранятся только в fp16 | панель 58:22-58:38; [t.me/souptasterschat/620](https://t.me/souptasterschat/620): можно, если меняется только хранение, а значения и dtype в вычислениях те же - у нас значения побитно те же |
 | Патч загрузчика transformers (куда класть веса при загрузке, без предварительного резервирования GPU-памяти) | патчи transformers в `apply()` - панель 43:04 ("через apply можно подменять код модели и операции"); пропустить `caching_allocator_warmup` - разрешено ([t.me/souptasterschat/2880](https://t.me/souptasterschat/2880), п. 1); значения весов и вся остальная загрузка те же, `hf_device_map` и dispatch модели не меняются; встроенный в Soup `activation_offloading` и другие его режимы не используются |
@@ -793,8 +790,8 @@ dtype вычислений, что запрещено ([t.me/souptasterschat/620
 | Свой расчёт loss, entropy, accuracy, loss строк и запись их в лог TRL и `rewind.jsonl` | README шаблона: "keep them with the same values (you may compute them faster)"; панель 26:24, 52:12-52:26 (готовую реализацию Soup вызывать нельзя, свой расчёт - можно); маски каждой метрики как у базы ([t.me/souptasterschat/576](https://t.me/souptasterschat/576), п. 1); проверка 5 |
 | Компиляция кернелов в потоке того же процесса, пока грузится модель; второй поток заводит страницы буфера `[gate \| up]` на хосте | панель 33:10-33:22 ("честная оптимизация"); поток - "yes u can" ([t.me/souptasterschat/615](https://t.me/souptasterschat/615)), процесс-помощник нельзя ([t.me/souptasterschat/834](https://t.me/souptasterschat/834), [t.me/souptasterschat/2505](https://t.me/souptasterschat/2505)); `TRITON_CACHE_DIR` каждого запуска пуст, между запусками ничего не хранится; подготовку до обучения ускорять можно ([t.me/souptasterschat/622](https://t.me/souptasterschat/622), п. 1 и 3) |
 | Кернелы без `tl.dot` | свои `@triton.jit` из `solution/` - проверки 3-4; панель 40:59-41:09 |
-| Своя токенизация строк без `datasets.map` (те же `format_row` и проверка, `Dataset.from_list`) | прямо этот вопрос ([t.me/souptasterschat/2987](https://t.me/souptasterschat/2987), п. 4) - "на все можно" ([t.me/souptasterschat/2989](https://t.me/souptasterschat/2989)); отпечаток `datasets` не подменяется ([t.me/souptasterschat/1548](https://t.me/souptasterschat/1548)), данные и их хэши в Soup те же |
-| Патчи запуска | раздел выше; [t.me/souptasterschat/592](https://t.me/souptasterschat/592), [t.me/souptasterschat/622](https://t.me/souptasterschat/622), [t.me/souptasterschat/834](https://t.me/souptasterschat/834) |
+| Токенизация - только `datasets.map` Soup (своя токенизация без `map` убрана) | сборку датасета своей токенизацией через `Dataset.from_dict` / `from_list` без `map` организаторы запретили ([t.me/souptasterschat/4879](https://t.me/souptasterschat/4879) на [t.me/souptasterschat/4867](https://t.me/souptasterschat/4867)), пропуск хэша токенизатора для fingerprint - тоже ([t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2: действует прежний запрет обхода fingerprint, [t.me/souptasterschat/1548](https://t.me/souptasterschat/1548)); раннее "на все можно" ([t.me/souptasterschat/2989](https://t.me/souptasterschat/2989)) этим перекрыто, патч удалён (`7962b1d`) |
+| Патчи запуска | раздел выше; [t.me/souptasterschat/592](https://t.me/souptasterschat/592), [t.me/souptasterschat/622](https://t.me/souptasterschat/622), [t.me/souptasterschat/834](https://t.me/souptasterschat/834); прямо наши патчи подтверждены в [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045): п. 1 - снимок карты пакетов, п. 3 - отложенные импорты sklearn / scipy без `sys.modules`, п. 4 - `TORCHDYNAMO_DISABLE` на время импорта bitsandbytes, п. 5 - стек CUDA |
 
 Чего мы не делаем: не включаем режимы Soup (`use_cut_ce`, `use_liger`, `gradient_checkpointing`,
 `activation_offloading`...) и не вызываем их внутренние реализации; не используем внешние
@@ -929,9 +926,6 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
   `F.dropout` PyTorch бит в бит на 5 формах (`test_dropout_masks_are_torchs`), весь шаг с dropout
   против HF + PEFT (`test_fused_step_dropout_matches_hf`), самопроверка первого шага и откат при
   несовпадении (`test_dropout_self_check`).
-- `solution/test_dataprep.py`: своя токенизация даёт тот же датасет, что `map` Soup (колонки, типы,
-  значения), ту же ошибку на строке без цели loss, необычные строки уходят в `map` Soup; побитно на
-  данных задачи и на 21 срезе; тесты падают, если наш путь ушёл в запасной.
 - `solution/test_fallback.py`: откат на код Soup в eval-режиме, с лишним ключом во входах, при
   левом паддинге и в цепочке train - eval - train после слитых шагов.
 - `solution/test_hostload.py`: NF4-веса, выгруженные на хост при загрузке, - те же значения, тот же
@@ -966,10 +960,9 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
   CUDA 16 байт лимит держится, а cuBLAS, attention и `lm_head_ce_kernel` дают те же значения.
 - 79 тестов Soup с нашими патчами (`SOUP_APPLY_SOLUTION=1`).
 
-Всего в `solution/` 66 тестов (с параметрами); в ноутбуке на Kaggle на коде `8c584c0` (T4, свежий
-кэш Triton) - 65 passed, 1 skipped (тест токенизации на данных задачи: токенизатор модели к этому
-моменту ещё не скачан). Пороги fp16 подобраны под T4, где два теста раньше падали только на этой
-карте (`42c35e5`, `af4857b`).
+Всего в `solution/` 70 тестов (с параметрами; `pytest --collect-only`); в ноутбуке на Kaggle на
+финальном коммите - [финал]. Пороги fp16 подобраны под T4, где два теста раньше падали только на
+этой карте (`42c35e5`, `af4857b`).
 
 **Гонка в кернелах головы - нашли своим аудитом прогонов и исправили** (`a9a1c25`).
 - Что нашли: сравнив loss строк rewind между двумя запусками решения на одних и тех же батчах во
@@ -1060,6 +1053,7 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | `HF_HUB_OFFLINE=1` в `apply()` (там же, п. 6) | харнесс уже запускает обучение с `HF_HUB_OFFLINE=1` (`harness/common.py`, строка 42): сетевых соединений в процессе решения и так 0 |
 | Дешёвый ключ кэша Triton: `triton_key()` при первой компиляции хэширует весь `libtriton.so` (416 МБ, ~1,1 с CPU); подменяли ключом из версии Triton, хэша его исходников `.py`, размера и mtime библиотеки (кэш каждого прогона пуст, компиляция та же; разрешено: [t.me/souptasterschat/2921](https://t.me/souptasterschat/2921), ответ [t.me/souptasterschat/2922](https://t.me/souptasterschat/2922), п. 2) | на Brev прогрев 8,8 -> 5,8 с, вся команда -0,28 с, 10/10; на Kaggle (два аккаунта, по 3 тёплые пары) по стене ~0 (-0,55..+0,72 с), а `apply()` дольше на 0,4-0,6 с: без 1,1 с хэша (sha256 отпускает GIL) компиляция стартует сразу и на 2 ядрах Kaggle отнимает GIL и CPU у импортов - время просто переезжает. Не взяли |
 | Не компилировать в прогреве `lm_head_ce_kernel` (он нужен только запасному пути) | Brev, 6 против 6: вне цикла 15,05 против 15,20 с, вся команда 42,10 против 42,16 с - шум |
+| Своя токенизация строк без `datasets.map` (те же `format_row` и проверка, `Dataset.from_list`; без dill-хэша токенизатора, ~2,1 с на Kaggle; была в `main` с `a008f6c` / `8c584c0`) | Kaggle A/B (2 аккаунта по 3 пары): вся команда -1,96..-3,27 с, цикл и пик те же. Убрали (`4a103f0`, `7962b1d`): организаторы ответили "нет" на сборку датасета своей токенизацией через `Dataset.from_dict` / `from_list` без `map` ([t.me/souptasterschat/4879](https://t.me/souptasterschat/4879) на [t.me/souptasterschat/4867](https://t.me/souptasterschat/4867)) и на пропуск хэша токенизатора для fingerprint ([t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2) |
 
 ## Ограничения и что не получилось
 
@@ -1074,7 +1068,7 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
   слоя (qkv, o, attention, нормы - GEMM `[gate | up]` теперь не пересчитывается) ещё стоит часть
   цикла: мы сознательно платим им за ~6x меньше памяти активаций.
 - **Вне цикла обучения мы выигрываем мало.** Импорты, загрузка модели, сохранение и выход - почти
-  те же, что у базы; патчи запуска дают ~-11 с (сумма A/B отдельных патчей), а фоновая компиляция даже с nice 19 в одном потоке
+  те же, что у базы; патчи запуска дают ~-8,5 с (сумма A/B отдельных патчей), а фоновая компиляция даже с nice 19 в одном потоке
   ещё отнимает ~1 с у загрузки модели (2 ядра x 2 потока). Остальное - не наше и есть у базы:
   `packages_distributions()` внутри `import transformers` в харнессе до `apply()` (2,3 с), ленивая загрузка ~78
   модулей CUDA кернелов PyTorch в первом шаге (~0,4 с) и завершение интерпретатора (~1,7 с, у базы
@@ -1125,7 +1119,6 @@ python fp16_path.py --config runs/local/task.yaml --metrics runs/local/metrics.j
 | `solution/hostload.py` | NF4-веса на хост сразу после квантования при загрузке модели |
 | `solution/offload.py` | эмбеддинг / `lm_head` в память CPU при загрузке модели |
 | `solution/patch.py` | подключение к Soup, бухгалтерия метрик, откат, `patch_prepare_kbit` (эмбеддинг в fp16), патч `packages_distributions`, `patch_weight_conversion`, `set_cuda_stack`, обходы модели на границе шага, замер шины для `AttnStream` (`_h2d_gbps`) |
-| `solution/dataprep.py` | своя токенизация строк SFT без `datasets.map` |
 | `solution/startup.py` | рабочая область cuBLAS `:16:8`; патчи импорта: bitsandbytes без TorchInductor, без sklearn / wandb |
 | `solution/warmup.py` | фоновая компиляция кернелов (один поток, nice 19, лаунчеры с -O0), заранее закреплённые блоки и заведение страниц буфера `[gate \| up]` |
 | `solution/test_*.py` | тесты корректности, отката и обеих выгрузок |
