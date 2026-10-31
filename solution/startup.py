@@ -21,17 +21,10 @@
   stays within the checks of the base, as with any GEMM). It must be set before the first cuBLAS
   call of the process, which in a `soup train` run comes with the first training step (cuBLASLt
   gets the same 128 KiB: CUBLASLT_WORKSPACE_SIZE, else it warns and is cut to it anyway). Allowed
-  by the organizers (t.me/souptasterschat/2880);
-- Triton keys its compile cache with `triton_key()`, which hashes the whole 416 MB libtriton.so
-  (~1.1 s of a CPU core, the first time our warm-up compiles, while the model loads). Every run
-  starts on an empty cache, so a key from Triton's version, its Python sources and the
-  library's size and modification time identifies the compiler just as well (organizers'
-  answer #2922, item 2); what gets compiled is unchanged.
+  by the organizers (t.me/souptasterschat/2880).
 """
 
 import contextlib
-import functools
-import hashlib
 import importlib
 import os
 import sys
@@ -191,39 +184,3 @@ def exit_without_teardown():
     threading.excepthook = thread_excepthook
     original_register(finish)
     atexit.register = register
-
-
-def cheaper_triton_key():
-    """Replace `triton.runtime.cache.triton_key` (see the module docstring); the warm-up thread
-    calls this before its first compile (warmup._run), so neither the import of Triton nor the
-    key is on the main thread."""
-    try:
-        import triton
-        from triton.runtime import autotuner, cache
-    except Exception:  # noqa: BLE001 - no Triton: nothing to key
-        return
-    if getattr(getattr(cache, "triton_key", None), "_soup_kernels_patched", False):
-        return
-    root = os.path.dirname(os.path.abspath(triton.__file__))
-
-    @functools.lru_cache()
-    def triton_key():
-        digest = hashlib.sha256()
-        for part in ("compiler", "backends", "language", "runtime"):
-            for path, dirs, files in os.walk(os.path.join(root, part)):
-                dirs.sort()
-                for name in sorted(files):
-                    if name.endswith(".py"):
-                        with open(os.path.join(path, name), "rb") as handle:
-                            digest.update(name.encode() + handle.read())
-        lib_dir = os.path.join(root, "_C")
-        for name in sorted(os.listdir(lib_dir)):
-            if name.startswith("libtriton"):
-                stat = os.stat(os.path.join(lib_dir, name))
-                digest.update(f"{name}:{stat.st_size}:{stat.st_mtime_ns}".encode())
-        return f"{triton.__version__}-{digest.hexdigest()}"
-
-    triton_key._soup_kernels_patched = True
-    cache.triton_key = triton_key
-    if getattr(autotuner, "triton_key", None) is not None:
-        autotuner.triton_key = triton_key
