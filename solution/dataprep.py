@@ -49,12 +49,9 @@ def _formatted(rows, format_row, split, max_length):
 
 
 def _all_int_lists(dataset):
-    """Every column a list of integers (datasets narrows input_ids to int32 and attention_mask to
-    int8 by their names, in from_list as in map's writer)."""
     import pyarrow as pa
 
-    return all(pa.types.is_list(field.type) and pa.types.is_integer(field.type.value_type)
-               for field in dataset.data.schema)
+    return all(field.type == pa.list_(pa.int64()) for field in dataset.data.schema)
 
 
 def patch_tokenization():
