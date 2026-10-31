@@ -610,20 +610,6 @@ def _attn_bwd(dout, q, k, v, out, lse, seed, offset, packed, scale):
     return dq[0], dk[0], dv[0]
 
 
-def _split_k_mm(a, b, parts, out=None):
-    """a @ b as `parts` accumulated GEMMs over slices of K. For the [tokens, 17920] x
-    [17920, 1536] backward GEMM through the fused gate/up weight, cuBLAS on a T4 picks a
-    slower kernel for the single long-K call (1.93 ms) than for four K=4480 ones (1.70 ms)."""
-    k = a.shape[1]
-    step = k // parts
-    if k % parts or step % 64:
-        return torch.mm(a, b, out=out)
-    out = torch.mm(a[:, :step], b[:step], out=out)
-    for i in range(1, parts):
-        out.addmm_(a[:, i * step:(i + 1) * step], b[i * step:(i + 1) * step])
-    return out
-
-
 # ---------------------------------------------------------------------------------------------
 # One decoder layer
 # ---------------------------------------------------------------------------------------------
@@ -955,7 +941,7 @@ class _Layer(torch.autograd.Function):
                 c1 = min(n, c0 + packed.mlp_chunk)
                 gu = b[c0:c1] @ w.t()
                 _glu_bwd(dm[c0:c1], gu, spec.I)
-                _split_k_mm(gu, w, 4, out=db[c0:c1])
+                torch.mm(gu, w, out=db[c0:c1])
                 del gu
             del w, b, dm
             dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
@@ -980,7 +966,7 @@ class _Layer(torch.autograd.Function):
             del dm
             w = f.pop("w_gu") if "w_gu" in f else dequant(
                 [spec.w["gate_proj"], spec.w["up_proj"]], dev)
-            db = _split_k_mm(gu, w, 4)
+            db = gu @ w
             del w
             del gu
             dh2 = _rms_bwd(spec, db, f.pop("h2"), f.pop("rstd2"), spec.ln2, packed, dres=dh3)
