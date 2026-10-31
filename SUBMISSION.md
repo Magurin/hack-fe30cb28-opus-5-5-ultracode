@@ -21,19 +21,19 @@ backward. NF4-веса слоёв и эмбеддинг / `lm_head` с загр�
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
-`180c8e4`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 17,0-17,6%).
+`6b1cc09`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 7,1% |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,4% |
+| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 7,5% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,5% |
 | `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA, суммы градиентов | 1,2% |
-| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,85% |
-| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,34% |
-| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,1 + 1,9% |
-| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,55 + 0,01% |
+| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,95% |
+| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,37% |
+| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,2 + 2,1% |
+| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,56 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **15,5%** (порог 5%) |
+| **Всего** | | | **16,4%** (порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -50,16 +50,16 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 81,8 | 50,4 | 1,624x speedup |
-| Training loop, 64 steps, s | 60,2 | 30,3 | 1,99x |
-| Peak GPU memory, MiB | 14 345 | 813 | 17,64x base/ours |
-| Eval loss (public rows) | 2,04963 | 2,04954 | -0,004% vs base |
+| Time of `soup train`, s (mean of 2 runs) | 79,3 | 48,7 | 1,628x speedup |
+| Training loop, 64 steps, s | 57,4 | 28,1 | 2,04x |
+| Peak GPU memory, MiB | 14 345 | 635 | 22,59x base/ours |
+| Eval loss (public rows) | 2,04965 | 2,04954 | -0,005% vs base |
 
-Коммит `180c8e4` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,616x / 17,64x.
+Коммит `6b1cc09` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,805x / 22,59x
+(медленная база, 88,5 с).
 
-- [x] All 10 checks of `harness/check_rules.py` passed: все 10 в шаблонном прогоне (проверка 10 -
-  79 тестов Soup passed); в прогоне `--repeats 2` проверки 1-9, проверка 10 пропущена флагом
-  `--skip-tests` (те же тесты уже прошли в этой сессии)
+- [x] All 10 checks of `harness/check_rules.py` passed: все 10 и в прогоне `--repeats 2`, и в
+  шаблонном (проверка 10 - 79 тестов Soup passed)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 Дополнительно (Brev T4, те же версии пакетов, не официальный замер; код с выгрузкой входов слоёв,
