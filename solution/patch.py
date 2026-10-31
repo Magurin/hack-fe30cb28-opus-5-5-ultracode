@@ -21,6 +21,7 @@ Anything we do not recognize falls through to the original code untouched.
 """
 
 import functools
+import os
 import sys
 import time
 import types
@@ -59,6 +60,12 @@ EXTRA_MEMORY_MIB = 0
 # host memory too, a T4 run of the public rows peaked at 795 / 715 / 635 MiB with 591 (the
 # would-be load rule) / 500 / 420, loop 27.10 / 27.28 / 27.53 s: 420 gives up 160 MiB for 0.4 s.
 STEP_CAP_MIB = 420
+# The per-thread stack the CUDA context reserves device memory for: 1 KiB by default for every
+# thread the GPU can hold at once, 40 MiB on a T4 outside PyTorch's allocator. Our kernels and the
+# ones PyTorch / cuBLAS launch here need none, and the driver raises the limit by itself for a
+# kernel that needs more. Allowed by the organizers (t.me/souptasterschat/2039). None: CUDA's
+# default.
+CUDA_STACK_BYTES = 16
 
 
 def _restore_callback_base():
@@ -80,6 +87,38 @@ class _RestoreWeights(_restore_callback_base()):
 
 def _log(message):
     print(f"[solution] {message}", file=sys.stderr, flush=True)
+
+
+def _loaded_cudart():
+    """The CUDA runtime library PyTorch loaded into this process (torch.cuda.cudart() has no
+    cudaDeviceSetLimit), or None."""
+    import ctypes
+    import glob
+
+    if sys.platform.startswith("linux"):
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            paths = [line.split()[-1] for line in maps if "libcudart.so" in line]
+    else:
+        paths = glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "cudart64_*.dll"))
+    return ctypes.CDLL(paths[0]) if paths else None
+
+
+def set_cuda_stack(nbytes):
+    """cudaDeviceSetLimit(cudaLimitStackSize, nbytes) on the current device; returns the limit in
+    effect afterwards (None if the runtime could not be reached)."""
+    import ctypes
+
+    try:
+        lib = _loaded_cudart()
+    except OSError:
+        lib = None
+    if lib is None:
+        return None
+    if lib.cudaDeviceSetLimit(0, ctypes.c_size_t(nbytes)) != 0:  # 0: cudaLimitStackSize
+        lib.cudaGetLastError()  # not left for PyTorch's next launch check
+    limit = ctypes.c_size_t()
+    lib.cudaDeviceGetLimit(ctypes.byref(limit), 0)
+    return limit.value
 
 
 def _is_supported(model):
@@ -416,13 +455,14 @@ def install(trainer, seed=0):
     trainer.add_callback(_RestoreWeights(engine))
     trainer.add_callback(_FlushMetrics(trainer))
     _walk_model_once(trainer)
+    stack = set_cuda_stack(CUDA_STACK_BYTES) if CUDA_STACK_BYTES is not None else None
     mib = 2**20
     _log(f"fused Qwen2 step installed ({len(engine.layers)} layers, LoRA dropout "
          f"{engine.dropout_p}, embedding in fp16: {fp16_embedding}); CUDA memory before "
          f"training: {torch.cuda.memory_allocated() // mib} MiB allocated, "
          f"{torch.cuda.memory_reserved() // mib} MiB reserved, peak reserved so far "
          f"{torch.cuda.max_memory_reserved() // mib} MiB; steps may keep activations up to "
-         f"{engine.memory_cap // mib} MiB allocated")
+         f"{engine.memory_cap // mib} MiB allocated; CUDA thread stack {stack} bytes")
     return True
 
 

@@ -367,3 +367,37 @@ def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, lay
     for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
         assert torch.equal(loss_a, loss_b)
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
+
+
+def test_cuda_stack_limit_leaves_the_kernels_alone():
+    """With the CUDA thread stack set to 16 bytes (patch.CUDA_STACK_BYTES) the limit holds and
+    cuBLAS, attention and our kernels give the same results as with CUDA's default."""
+    from solution import kernels as K
+    from solution.engine import CE_BLOCK
+    from solution.patch import set_cuda_stack
+
+    def work():
+        g = torch.Generator(device=DEV).manual_seed(3)
+        a = torch.randn((300, 1536), device=DEV, generator=g).half()
+        b = torch.randn((1536, 2048), device=DEV, generator=g).half()
+        logits = a @ b
+        q = torch.randn((1, 4, 64, 64), device=DEV, generator=g).half()
+        att = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+        targets = torch.randint(0, 2048, (300,), device=DEV, generator=g)
+        loss = torch.empty(300, device=DEV)
+        ent = torch.empty(300, device=DEV)
+        cor = torch.empty(300, device=DEV, dtype=torch.int32)
+        K.lm_head_ce_kernel[(300,)](logits, targets, loss, ent, cor, 2048, 1, BLOCK=CE_BLOCK,
+                                    num_warps=8)
+        return logits, att, loss, ent, cor
+
+    default = set_cuda_stack(1024)
+    assert default == 1024
+    before = work()
+    try:
+        assert set_cuda_stack(16) == 16
+        after = work()
+        assert set_cuda_stack(16) == 16  # nothing above raised it
+    finally:
+        set_cuda_stack(default)
+    assert all(torch.equal(x, y) for x, y in zip(before, after))
