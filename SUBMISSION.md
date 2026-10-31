@@ -22,19 +22,19 @@ backward тоже ждут на хосте (последние - вместо п
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
-`03b9441`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
+`5f9b2ef`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
 | `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 8,0% |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA (маска бит в бит как у базы) | 2,8% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA (маска бит в бит как у базы) | 2,3% |
 | `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA (те же маски), суммы градиентов | 1,3% |
-| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,92% |
-| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,36% |
-| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,2 + 2,1% |
+| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,85% |
+| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,33% |
+| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,1 + 2,0% |
 | `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,73 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **17,5%** (порог 5%) |
+| **Всего** | | | **16,6%** (порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -51,13 +51,13 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 83,4 | 48,2 | 1,729x speedup |
-| Training loop, 64 steps, s | 61,3 | 28,2 | 2,18x |
+| Time of `soup train`, s (mean of 2 runs) | 87,2 | 50,5 | 1,728x speedup |
+| Training loop, 64 steps, s | 65,2 | 30,5 | 2,14x |
 | Peak GPU memory, MiB | 14 345 | 601 | 23,87x base/ours |
-| Eval loss (public rows) | 2,04966 | 2,04952 | -0,007% vs base |
+| Eval loss (public rows) | 2,04967 | 2,04970 | +0,001% vs base |
 
-Код `03b9441` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,884x / 23,87x -
-завышен холодной базой (92,2 с), опираемся на r2. Наши r2 в разных сессиях: 1,598-1,729x.
+Код `5f9b2ef` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,791x / 23,87x -
+завышен холодной базой (92,9 с), опираемся на r2. Наши r2 в разных сессиях: 1,598-1,729x.
 
 - [x] All 10 checks of `harness/check_rules.py` passed: все 10 и в прогоне `--repeats 2`, и в
   шаблонном (проверка 10 - 79 тестов Soup passed)
