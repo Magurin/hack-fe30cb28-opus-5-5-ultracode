@@ -134,7 +134,9 @@ def exit_without_teardown():
     if not FAST_EXIT or getattr(sys.exit, "_soup_kernels_patched", False):
         return
     state = {"code": None, "error": False}
+    later = []  # exit handlers registered after this one: they have run when it runs
     original_exit, original_hook = sys.exit, sys.excepthook
+    original_register = atexit.register
     original_thread_hook = threading.excepthook
 
     def exit(code=None):
@@ -149,16 +151,23 @@ def exit_without_teardown():
         state["error"] = True
         original_thread_hook(args)
 
+    def register(func, *args, **kwargs):
+        later.append(func)
+        return original_register(func, *args, **kwargs)
+
     def finish():
         code = state["code"]
         if state["error"] or not isinstance(code, int) or isinstance(code, bool):
             return
+        # the handlers registered before this one, each once (atexit._run_exitfuncs runs the
+        # whole list again: the later ones, which ran already, come off it first)
         atexit.unregister(finish)
-        atexit._run_exitfuncs()  # every other exit handler, as the interpreter would run them
+        for func in later:
+            atexit.unregister(func)
+        atexit._run_exitfuncs()
+        torch = sys.modules.get("torch")  # (no import at exit: only if the run used it)
         try:
-            import torch
-
-            if torch.cuda.is_available() and torch.cuda.is_initialized():
+            if torch is not None and torch.cuda.is_initialized():
                 torch.cuda.synchronize()  # nothing still runs on the GPU
         except Exception:  # noqa: BLE001 - then the usual teardown, which reports it
             return
@@ -173,4 +182,5 @@ def exit_without_teardown():
     sys.exit = exit
     sys.excepthook = excepthook
     threading.excepthook = thread_excepthook
-    atexit.register(finish)
+    original_register(finish)
+    atexit.register = register
