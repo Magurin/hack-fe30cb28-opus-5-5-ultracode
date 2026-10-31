@@ -9,10 +9,10 @@ backward тоже ждут на хосте (последние - вместо п
 Подробно - `README.md`.
 
 ## Links
-- Repository, code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/7962b1d
-  (`solution_sha256` `522e22c0`). Since then `main` also has the fast exit (`9522c1b`, `bfff00c`) and
-  the late warm-up with NF4 loaded straight into pinned memory (`feca479`, `43765db`, `838827f`):
-  -1.8 s and -0.4..-0.9 s in Kaggle A/Bs; the official measurement of the current `main` will replace this
+- Repository, code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/bfff00c
+  (`solution_sha256` `9efa8ec1`). Since then `main` also has the late warm-up with NF4 loaded straight
+  into pinned memory (`feca479`, `43765db`, `838827f`): -0.4..-0.9 s out of the loop in Kaggle A/Bs;
+  the official measurement of the current `main` will replace this
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
   (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
@@ -40,7 +40,7 @@ backward тоже ждут на хосте (последние - вместо п
 | `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,5 + 2,7% |
 | `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,70 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **17,7%** (`7962b1d`, меньший из 2 запусков r2; шаблонный прогон - 18,8%; порог 5%) |
+| **Всего** | | | **18,0%** (`bfff00c`, меньший из 2 запусков r2; шаблонный прогон - 18,2%; порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -57,13 +57,14 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 82,59 | 46,47 | 1,777x speedup |
-| Training loop, 64 steps, s | 60,51 | 26,36 | 2,30x |
+| Time of `soup train`, s (mean of 2 runs) | 80,26 | 44,22 | 1,815x speedup |
+| Training loop, 64 steps, s | 58,62 | 25,57 | 2,29x |
 | Peak GPU memory, MiB | 14 345 | 463 | 30,98x base/ours |
-| Eval loss (public rows) | 2,04964 | 2,04966 | +0,001% vs base |
+| Eval loss (public rows) | 2,04964 | 2,04971 | +0,003% vs base |
 
-Код `7962b1d` (Kaggle, 31.10, версия 23 ноутбука `magurin/soup-kernel-run`; шаблонный прогон той же
-версии - 1,972x / 30,98x при холодной базе 89,5 с). Прошлые официальные замеры тем же ноутбуком (r2, все 10 проверок):
+Код `bfff00c` (Kaggle, 31.10, версия 24 ноутбука `magurin/soup-kernel-run`; шаблонный прогон той же
+версии - 1,768x / 30,98x). Прошлые официальные замеры тем же ноутбуком (r2, все 10 проверок):
+`7962b1d` - 1,777x / 30,98x (463 MiB, `522e22c0`, до быстрого выхода, шаблон 1,972x при холодной базе),
 `a123fba` - 1,8448x / 26,418x (пик 543 MiB, `solution_sha256` `f302c7e6`, медленная сессия, шаблон
 1,964x), `9d31eea` - 1,8322x / 25,48x (563 MiB, `9155f08c`, шаблон 2,005x), `8c584c0` - 1,824x /
 24,61x (583 MiB). Эти три ещё токенизировали своим кодом без `datasets.map`; организаторы позже
@@ -71,7 +72,7 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 [t.me/souptasterschat/5045](https://t.me/souptasterschat/5045), п. 2), и финальный код токенизирует
 снова `map` Soup (~2-3 с вне цикла).
 
-- [x] All 10 checks of `harness/check_rules.py` passed: да (`7962b1d`, версия 23: и `--repeats 2`, и шаблонный прогон; во всех прошлых официальных замерах
+- [x] All 10 checks of `harness/check_rules.py` passed: да (`bfff00c`, версия 24: и `--repeats 2`, и шаблонный прогон; во всех прошлых официальных замерах
   - все 10 и в `--repeats 2`, и в шаблонном; проверка 10 - 79 тестов Soup passed)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
