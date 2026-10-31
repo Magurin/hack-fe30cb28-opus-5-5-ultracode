@@ -401,3 +401,39 @@ def test_cuda_stack_limit_leaves_the_kernels_alone():
     finally:
         set_cuda_stack(default)
     assert all(torch.equal(x, y) for x, y in zip(before, after))
+
+
+@pytest.mark.parametrize("layers", [2, 7])
+def test_lean_gate_up_in_host_memory_is_exact(tmp_path, layers):
+    """A lean step's [gate | up] chunks kept in pinned host memory (GuStream.begin_lean: a ring
+    of chunk buffers, the backward fetching one ahead across chunks and layers) instead of
+    recomputed give bit-identical loss and LoRA gradients, over two steps."""
+    from solution.engine import FusedQwen2
+    from solution.patch import _embedding_to_fp16
+
+    model = _tiny_model(tmp_path, dropout=0.1, layers=layers)
+    model.train()
+    assert _embedding_to_fp16(model.get_base_model())
+    batches = [_batch(6, [17, 60, 33, 5]), _batch(7, [40, 12, 64])]
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def run(gu_on_host):
+        engine = FusedQwen2(model, seed=11)
+        engine.offload_weights()
+        engine.offload_head()
+        engine.offload_inputs()
+        if gu_on_host:
+            engine.offload_gus()
+        engine.mlp_chunk = 16
+        engine.set_memory_cap(1)  # nothing fits: no keeping, lean
+        out = []
+        for ids, mask, labels in batches:
+            loss, packed, _ = engine.step(ids, mask, labels, 80.0)
+            assert packed.lean and (packed.gus is not None) == gu_on_host
+            out.append((loss, torch.autograd.grad(loss, params)))
+        engine.restore_weights()
+        return out
+
+    for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
+        assert torch.equal(loss_a, loss_b)
+        assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))

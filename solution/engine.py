@@ -434,6 +434,7 @@ class GuStream(_HostRing):
     def __init__(self, layers, device):
         super().__init__(layers, device)
         self.registered = None  # `host`, if pinned in place (unregistered before it is freed)
+        self.chunk = None  # tokens per [gate | up] chunk in a lean step (begin_lean)
 
     def unregister(self):
         if self.registered is not None:
@@ -448,7 +449,7 @@ class GuStream(_HostRing):
         """Free the ring: the compute stream has waited for every copy into or out of it."""
         self.ring = None
 
-    def begin(self, n, cols):
+    def _host(self, n, cols):
         if self.host is None and GuStream.pages is not None:
             pages, GuStream.pages = GuStream.pages, None
             if pages.shape[1] >= n and pages.shape[2] == cols \
@@ -457,10 +458,72 @@ class GuStream(_HostRing):
         if self.host is not None and self.host.shape[1] < n:
             self.unregister()  # _host_rows makes a bigger one
         self._host_rows(n, cols, torch.float16)  # 1.9 GiB for 2048 tokens
+
+    def begin(self, n, cols):
+        self._host(n, cols)
         self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
         self.n = n
         self.upto = 0
         self.in_slot = [None] * self.SLOTS
+        self.chunk = None
+
+    def begin_lean(self, n, cols, chunk):
+        """A lean step (FusedQwen2.lean): every layer's [gate | up], in its chunks of `chunk`
+        tokens (the MLP's), goes to host memory through a ring of SLOTS chunk buffers instead
+        of the layer's whole output; the backward fetches the chunks back one ahead, in its
+        order (the layers from the last, a layer's chunks from the first)."""
+        self._host(n, cols)
+        self.ring = torch.empty((self.SLOTS, chunk, cols), device=self.device,
+                                dtype=torch.float16)
+        self.n, self.chunk, self.upto = n, chunk, 0
+        self.k = 0  # chunks written so far
+        self.copied = [None] * self.SLOTS  # per slot: its last copy out
+        self.loaded = {}  # (layer, first token) -> (slot, event of its copy in)
+
+    def chunk_slot(self, rows):
+        """Lean forward: the slot the next chunk's [gate | up] GEMM writes into."""
+        s = self.k % self.SLOTS
+        self.k += 1
+        if self.copied[s] is not None:
+            torch.cuda.current_stream(self.device).wait_event(self.copied[s])
+        return s, self.ring[s, :rows]
+
+    def chunk_save(self, s, i, c0, c1):
+        """Lean forward: copy chunk c0:c1 of layer i (in slot s) out."""
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        self.out_stream.wait_event(ready)
+        with torch.cuda.stream(self.out_stream):
+            self.host[i, c0:c1].copy_(self.ring[s, :c1 - c0], non_blocking=True)
+            self.copied[s] = torch.cuda.Event()
+            self.copied[s].record(self.out_stream)
+
+    def _chunk_fetch(self, key, s):
+        i, c0 = key
+        c1 = min(self.n, c0 + self.chunk)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))  # the slot's last reader is done
+        self.in_stream.wait_event(ready)
+        if self.copied[s] is not None:  # (the forward's copy out of the slot)
+            self.in_stream.wait_event(self.copied[s])
+        with torch.cuda.stream(self.in_stream):
+            self.ring[s, :c1 - c0].copy_(self.host[i, c0:c1], non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.in_stream)
+        self.loaded[key] = (s, done)
+
+    def chunk_load(self, i, c0, c1):
+        """Lean backward: chunk c0:c1 of layer i's [gate | up] on the current stream; starts
+        fetching the next one."""
+        key = (i, c0)
+        if key not in self.loaded:
+            self._chunk_fetch(key, 0)
+        s, done = self.loaded.pop(key)
+        torch.cuda.current_stream(self.device).wait_event(done)
+        nxt = (i, c1) if c1 < self.n else (i - 1, 0)
+        if nxt[0] >= 0:
+            self._chunk_fetch(nxt, 1 - s)
+        return self.ring[s, :c1 - c0]
 
     def holds(self, i):
         return i < self.upto
@@ -841,9 +904,15 @@ def _layer_forward(spec, h, packed, lora16, seeds, keep, gu=None, return_gu=Fals
         # the MLP over chunks of tokens: [gate | up] of MLP_CHUNK tokens at a time
         del aq, av, q, k, v, k_e, v_e, out, lse
         m = torch.empty((n, spec.I), device=dev, dtype=torch.float16)
+        gus = packed.gus if packed.gus is not None and packed.gus.chunk else None
         for c0 in range(0, n, packed.mlp_chunk):
             c1 = min(n, c0 + packed.mlp_chunk)
-            _glu_fwd(b[c0:c1] @ w.t(), spec.I, out=m[c0:c1])
+            if gus is None:
+                _glu_fwd(b[c0:c1] @ w.t(), spec.I, out=m[c0:c1])
+            else:  # into a GuStream chunk slot, copied to host memory for the backward
+                slot, gu = gus.chunk_slot(c1 - c0)
+                _glu_fwd(torch.mm(b[c0:c1], w.t(), out=gu), spec.I, out=m[c0:c1])
+                gus.chunk_save(slot, spec.index, c0, c1)
         del w, b
         w = dequant([spec.w["down_proj"]], dev)
         d = m @ w.t()
@@ -937,9 +1006,10 @@ class _Layer(torch.autograd.Function):
             b = f.pop("b")
             w = dequant([spec.w["gate_proj"], spec.w["up_proj"]], dev)
             db = torch.empty((n, H), device=dev, dtype=torch.float16)
+            gus = packed.gus if packed.gus is not None and packed.gus.chunk else None
             for c0 in range(0, n, packed.mlp_chunk):
                 c1 = min(n, c0 + packed.mlp_chunk)
-                gu = b[c0:c1] @ w.t()
+                gu = b[c0:c1] @ w.t() if gus is None else gus.chunk_load(spec.index, c0, c1)
                 _glu_bwd(dm[c0:c1], gu, spec.I)
                 torch.mm(gu, w, out=db[c0:c1])
                 del gu
@@ -1469,8 +1539,13 @@ class FusedQwen2:
         packed.keep_all_from = L - k_all
         packed.mlp_chunk = self.mlp_chunk
         packed.lean = k_gu == 0 and self.lean(packed.n)
-        if packed.gus is not None:
-            packed.gus.upto = 0 if packed.lean else packed.keep_gu_from
+        if packed.lean and self.gus is not None:
+            # (the lean step's [gate | up] chunks to host memory, ring of chunks)
+            self.gus.release()
+            self.gus.begin_lean(packed.n, cols, packed.mlp_chunk)
+            packed.gus = self.gus
+        elif packed.gus is not None:
+            packed.gus.upto = packed.keep_gu_from
         head = self.head
         if head is not None:
             h = head.embed(packed.ids)
