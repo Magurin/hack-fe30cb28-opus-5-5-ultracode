@@ -562,11 +562,11 @@ def test_long_step_gate_up_in_host_memory_in_chunks(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("ring", ["chunks", "whole"])
 def test_long_step_attention_in_host_memory_is_exact(tmp_path, monkeypatch, ring):
-    """A long step the plan's prediction leaves without AttnStream (its [gate | up] in host
-    memory in chunks, or a ring of whole outputs that fits but not beside AttnStream's) takes it
-    when _held_peak says the step fits: every layer's attention tensors go to host memory, the
-    step is not lean, and loss and LoRA gradients are bit for bit those of recomputing the
-    attention (the same step without AttnStream)."""
+    """A long step whose ring of whole [gate | up] outputs fits but, by the plan's prediction,
+    not beside AttnStream's takes AttnStream when _held_peak says the step fits: every layer's
+    attention tensors go to host memory, the step is not lean, and loss and LoRA gradients are
+    bit for bit those of recomputing the attention (the same step without AttnStream). A step
+    with its [gate | up] in chunks never takes it."""
     from solution.engine import FusedQwen2, GuStream
     from solution.patch import _embedding_to_fp16
 
@@ -602,8 +602,8 @@ def test_long_step_attention_in_host_memory_is_exact(tmp_path, monkeypatch, ring
                 whole - 1 if ring == "chunks" else whole))
             loss, packed, _ = engine.step(ids, mask, labels, 80.0)
             assert not packed.lean and (packed.gus.chunk == 32) == (ring == "chunks")
-            assert (packed.attns is not None) == attn_on_host
-            assert not attn_on_host or packed.attns.upto == layers
+            assert (packed.attns is not None) == (attn_on_host and ring == "whole")
+            assert packed.attns is None or packed.attns.upto == layers
             out.append((loss, torch.autograd.grad(loss, params)))
         engine.restore_weights()
         return out
@@ -611,4 +611,5 @@ def test_long_step_attention_in_host_memory_is_exact(tmp_path, monkeypatch, ring
     for (loss_a, grads_a), (loss_b, grads_b) in zip(run(False), run(True)):
         assert torch.equal(loss_a, loss_b)
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
-    assert sorted(loaded) == sorted(list(range(layers)) * len(batches))
+    expected = list(range(layers)) * len(batches) if ring == "whole" else []
+    assert sorted(loaded) == sorted(expected)

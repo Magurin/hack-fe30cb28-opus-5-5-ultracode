@@ -549,10 +549,10 @@ class GuStream(_HostRing):
 
 
 class AttnStream(_HostRing):
-    """What the backward of a layer that has its [gate | up] (from GuStream, whole or in chunks,
-    or kept on the GPU) would otherwise recompute before it: q, k, v (RoPE applied), the
-    attention output and the o_proj output, in pinned host memory between forward and backward,
-    for every layer of a step with a GuStream ring that is not lean. The backward then runs only
+    """What the backward of a layer that has its [gate | up] (from GuStream or kept on the GPU)
+    would otherwise recompute before it: q, k, v (RoPE applied), the attention output and the
+    o_proj output, in pinned host memory between forward and backward, for every layer of a
+    step with a GuStream ring of whole outputs that is not lean. The backward then runs only
     the two RMSNorms again (the LoRA inputs and their dropout masks, the residual after
     attention from o), not the qkv and o GEMMs, RoPE and the attention: on a T4 ~20 ms of a
     step. k and v go out as their HKV heads, not the HQ heads the attention reads, and are
@@ -1259,9 +1259,7 @@ class _Layer(torch.autograd.Function):
                         and not packed.gus.chunk:
                     gu = packed.gus.load(spec.index)
                 attn = None
-                chunked = packed.gus is not None and packed.gus.chunk \
-                    and packed.gus.holds(spec.index)  # its [gate | up] comes back in chunks
-                if (gu is not None or chunked) and packed.attns is not None \
+                if gu is not None and packed.attns is not None \
                         and packed.attns.holds(spec.index):
                     attn = packed.attns.load_attn(spec.index, spec)
                 with torch.no_grad():
@@ -1747,7 +1745,8 @@ class FusedQwen2:
 
     def offload_attns(self):
         """Keep the attention tensors of the layers in pinned host memory too, on steps with a
-        GuStream ring (AttnStream): their backward recomputes nothing but the two RMSNorms."""
+        GuStream ring of whole outputs (AttnStream): their backward recomputes nothing but the
+        two RMSNorms."""
         if self.attns is None:
             self.attns = AttnStream(len(self.layers), self.device)
 
@@ -1862,10 +1861,14 @@ class FusedQwen2:
                         self.gus.begin_chunks(packed.n, cols, self.mlp_chunk)
                         packed.gus = self.gus
         late_attn = 0  # bytes of an AttnStream ring the check below took
-        if packed.gus is not None and packed.attns is None and self.attns is not None:
+        if packed.gus is not None and not packed.gus.chunk and packed.attns is None \
+                and self.attns is not None:
             # A long step: the check above (the plan's prediction) left AttnStream out, but a
             # step with no layer keeping [gate | up] on the GPU peaks lower than that predicts
-            # (_held_peak): its attention tensors go to host memory too, beside either ring.
+            # (_held_peak): its attention tensors go to host memory too. Only beside a ring of
+            # whole outputs: beside one of chunks (the longest steps, 1 300-2 048 tokens) the
+            # copies of both made a 4 x 512-token run on a T4 instance 10 s slower and its peak
+            # 42 MiB higher.
             attn = self.attns.ring_bytes(packed.n, self.layers[0], packed.rows, packed.max_len)
             if self._held_fits(packed.n, attn):
                 self.attns.begin(packed.n, self.layers[0], packed.rows, packed.max_len)
