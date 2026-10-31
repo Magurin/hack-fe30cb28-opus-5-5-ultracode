@@ -23,6 +23,7 @@ import torch
 # more than it shortens the compilation (3 threads: 0.8-1.3 s more outside the training loop).
 COMPILE_THREADS = 1
 _thread = None
+_pages = None  # the thread faulting in engine.GuStream's host buffer
 _timing = {}
 
 
@@ -209,6 +210,24 @@ def start(base_model):
 
     _thread = threading.Thread(target=work, name="solution-kernel-warmup", daemon=True)
     _thread.start()
+    from . import patch
+
+    if patch.OFFLOAD_GU:
+        global _pages
+        _pages = threading.Thread(target=_fault_in_gu_pages, args=(dims,),
+                                  name="solution-gu-pages", daemon=True)
+        _pages.start()
+
+
+def _fault_in_gu_pages(dims):
+    """Fault in the 2 GiB host buffer of the [gate | up] outputs (engine.GuStream.pages) as plain
+    memory while the model loads: the first training step only pins it in place (~0.1 s on a T4
+    host instead of ~0.95 s to pin a new one, which held up the main thread even from here)."""
+    _lower_priority()
+    from . import engine as E
+
+    E.GuStream.pages = torch.zeros((dims["L"], E.GuStream.HOST_ROWS, 2 * dims["I"]),
+                                   dtype=torch.float16)
 
 
 def start_from_command_line(argv):
@@ -229,4 +248,6 @@ def wait(timeout=300):
     started = time.perf_counter()
     if _thread is not None:
         _thread.join(timeout)
+    if _pages is not None:
+        _pages.join(timeout)
     return time.perf_counter() - started, _timing.get("compile_s")

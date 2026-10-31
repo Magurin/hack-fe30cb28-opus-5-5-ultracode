@@ -417,7 +417,24 @@ class GuStream(_HostRing):
     The layers write their [gate | up] GEMM straight into their slot. The ring is sized to each
     step's tokens and allocated before the step's plan, so the layers keeping [gate | up] on the
     GPU are fewer by its size: their forward, with the whole ring allocated, is where a step
-    with the layer inputs in host memory peaks."""
+    with the layer inputs in host memory peaks.
+
+    The 2 GiB host buffer is costly to pin (~0.95 s on a T4 host, most of it faulting the pages
+    in, which holds up the training even on another thread): a thread of warmup.py faults it in
+    as plain memory while the model loads (`pages`), and the first step pins it in place
+    (~0.1 s)."""
+
+    pages = None  # [L, HOST_ROWS, 2 * I] fp16 in pageable memory, from warmup.py
+
+    def __init__(self, layers, device):
+        super().__init__(layers, device)
+        self.registered = None  # `host`, if pinned in place (unregistered before it is freed)
+
+    def unregister(self):
+        if self.registered is not None:
+            torch.cuda.synchronize(self.device)  # no copy still reads it
+            torch.cuda.cudart().cudaHostUnregister(self.registered.data_ptr())
+            self.registered = self.host = None
 
     def ring_bytes(self, n, cols):
         return self.SLOTS * n * cols * 2
@@ -427,6 +444,13 @@ class GuStream(_HostRing):
         self.ring = None
 
     def begin(self, n, cols):
+        if self.host is None and GuStream.pages is not None:
+            pages, GuStream.pages = GuStream.pages, None
+            if pages.shape[1] >= n and pages.shape[2] == cols \
+                    and _pin_in_place(pages, self.device):
+                self.host = self.registered = pages
+        if self.host is not None and self.host.shape[1] < n:
+            self.unregister()  # _host_rows makes a bigger one
         self._host_rows(n, cols, torch.float16)  # 2 GiB for 2048 tokens
         self.ring = torch.empty((self.SLOTS, n, cols), device=self.device, dtype=torch.float16)
         self.n = n
@@ -1393,6 +1417,8 @@ class FusedQwen2:
         all saving a LoRA adapter needs; the first forward call of any of the 4-bit layers or of
         the embedding (if anything runs the model afterwards) brings them back to the GPU first."""
         self.head = None
+        if self.gus is not None:
+            self.gus.unregister()
         if self.stream is None and self.embed.device == self.device:
             return
         for spec in self.layers:

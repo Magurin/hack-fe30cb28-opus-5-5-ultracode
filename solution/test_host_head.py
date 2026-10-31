@@ -317,14 +317,16 @@ def test_layer_inputs_in_host_memory_are_exact(tmp_path, monkeypatch, slots, cap
         assert all(torch.equal(a, b) for a, b in zip(grads_a, grads_b))
 
 
-@pytest.mark.parametrize("slots,k_gu,layers", [(1, 0, 2), (2, 0, 2), (1, 1, 2), (2, 0, 7),
-                                               (2, 3, 7)])
-def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, layers):
+@pytest.mark.parametrize("slots,k_gu,layers,pages", [(1, 0, 2, False), (2, 0, 2, False),
+                                                     (1, 1, 2, False), (2, 0, 7, False),
+                                                     (2, 3, 7, False), (2, 0, 7, True)])
+def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, layers, pages):
     """[gate | up] outputs kept in pinned host memory (GuStream) instead of recomputed in
     backward give bit-identical loss and LoRA gradients, with the weights streamed and the head
     and layer inputs on the host too, over two steps; also with the last layers keeping their
     [gate | up] on the GPU (k_gu). With 7 layers the ring's slots are written again and the
-    backward fetches ahead."""
+    backward fetches ahead. With pages, the host buffer is the plain memory warmup.py would
+    have faulted in, pinned in place by the first step and unregistered at the end."""
     from solution.engine import FusedQwen2, GuStream
     from solution.patch import _embedding_to_fp16
 
@@ -343,12 +345,20 @@ def test_gate_up_in_host_memory_is_exact(tmp_path, monkeypatch, slots, k_gu, lay
         engine.offload_inputs()
         if gu_on_host:
             engine.offload_gus()
+            if pages:
+                spec = engine.layers[0]
+                monkeypatch.setattr(GuStream, "pages", torch.zeros(
+                    (layers, GuStream.HOST_ROWS, 2 * spec.I), dtype=torch.float16))
+                ptr = GuStream.pages.data_ptr()
         out = []
         for ids, mask, labels in batches:
             loss, packed, _ = engine.step(ids, mask, labels, 80.0)
             assert (packed.gus is not None) == gu_on_host
             assert not gu_on_host or packed.gus.upto == layers - k_gu
             out.append((loss, torch.autograd.grad(loss, params)))
+        if gu_on_host and pages:
+            assert engine.gus.registered.data_ptr() == ptr and engine.gus.host.is_pinned()
+            engine.gus.unregister()
         engine.restore_weights()
         return out
 
