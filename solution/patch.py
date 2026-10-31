@@ -543,6 +543,9 @@ def patch_soup():
 
     startup.import_without_wandb(sys.argv)  # imports trl, so after the snapshot above
     patch_prepare_kbit()
+    from . import dataprep
+
+    dataprep.patch_tokenization()
     if OFFLOAD_HEAD:
         offload.patch_model_loading()
     if HOST_NF4_AT_LOAD:
