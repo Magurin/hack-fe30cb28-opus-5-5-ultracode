@@ -22,19 +22,19 @@ backward тоже ждут на хосте (последние - вместо п
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
-`6b1cc09`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
+`9de39df`, публичные строки, меньший из двух запусков `--repeats 2` (на Brev T4 - 16,7-17,2%).
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 7,5% |
-| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,5% |
-| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA, суммы градиентов | 1,2% |
-| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,95% |
-| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,37% |
-| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,2 + 2,1% |
-| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,56 + 0,01% |
+| `nf4_dequant_kernel` | `solution/kernels.py` | деквантизация NF4 в bitsandbytes (absmax + 4 бита, 2 кернела); у нас один проход, один запуск на [q\|k\|v] и один на [gate\|up], побитно как bnb | 7,6% |
+| `rms_fwd_kernel` | `solution/kernels.py` | fp32 RMSNorm (5-6 операций PyTorch), residual add, касты в fp16, dropout входов LoRA | 2,6% |
+| `rms_bwd_kernel` | `solution/kernels.py` | backward RMSNorm, backward dropout LoRA, суммы градиентов | 1,3% |
+| `qkv_rope_fwd_kernel` | `solution/kernels.py` | разрезка q/k/v, fp32-касты, прибавка LoRA, `apply_rotary_pos_emb`, `repeat_kv` | 0,81% |
+| `qkv_rope_bwd_kernel` | `solution/kernels.py` | backward RoPE, backward `repeat_kv`, сборка градиентов под один GEMM | 0,32% |
+| `glu_fwd_kernel`, `glu_bwd_kernel` | `solution/kernels.py` | fp32 silu * up и его backward над слитым `[gate \| up]` | 1,0 + 1,8% |
+| `lm_head_piece_kernel`, `lm_head_finish_kernel` | `solution/kernels.py` | fp32-логиты, cross-entropy, entropy и accuracy TRL, loss строк для rewind, градиент логитов - по кускам словаря, пока вес `lm_head` стримится с хоста | 0,69 + 0,01% |
 | `lm_head_ce_kernel` | `solution/kernels.py` | то же за один проход по словарю, если вес `lm_head` на GPU (`OFFLOAD_HEAD = False`) | - |
-| **Всего** | | | **16,4%** (порог 5%) |
+| **Всего** | | | **16,2%** (порог 5%) |
 
 Ideas taken from other kernels, with links (we wrote the code ourselves): Liger-Kernel fused
 RMSNorm и fused linear cross-entropy (https://github.com/linkedin/Liger-Kernel), Unsloth
@@ -51,13 +51,14 @@ varlen API (https://arxiv.org/abs/2205.14135; у нас - встроенное �
 
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (mean of 2 runs) | 79,3 | 48,7 | 1,628x speedup |
-| Training loop, 64 steps, s | 57,4 | 28,1 | 2,04x |
-| Peak GPU memory, MiB | 14 345 | 635 | 22,59x base/ours |
-| Eval loss (public rows) | 2,04965 | 2,04954 | -0,005% vs base |
+| Time of `soup train`, s (mean of 2 runs) | 88,3 | 51,8 | 1,705x speedup |
+| Training loop, 64 steps, s | 66,4 | 32,0 | 2,07x |
+| Peak GPU memory, MiB | 14 345 | 639 | 22,45x base/ours |
+| Eval loss (public rows) | 2,04961 | 2,04956 | -0,002% vs base |
 
-Коммит `6b1cc09` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,805x / 22,59x
-(медленная база, 88,5 с).
+Коммит `9de39df` (Kaggle, 31.10). Шаблонный прогон того же ноутбука (один запуск): 1,739x / 22,52x.
+Экземпляр был горячим и медленным (база 88 с против 79-82 в прошлых сессиях), часть роста speedup -
+условия сессии; прошлый замер `6b1cc09` - 1,628x / 22,59x (см. README, "Kaggle T4").
 
 - [x] All 10 checks of `harness/check_rules.py` passed: все 10 и в прогоне `--repeats 2`, и в
   шаблонном (проверка 10 - 79 тестов Soup passed)
@@ -80,7 +81,7 @@ RoPE, SwiGLU, голова кусками словаря с online logsumexp), �
 См. README.md, "Ограничения и что не получилось": решение заточено под Qwen2 + NF4 + LoRA на q/v в
 fp16 (иначе исходный код Soup); GEMM cuBLAS ~69% работы GPU и свой GEMM на Triton для T4 не
 получился; вне цикла обучения выигрыш небольшой (~7 с патчами запуска по сумме их A/B); из пика
-635 MiB ~167 MiB - вне аллокатора PyTorch (CUDA-контекст, модули кернелов, cuBLAS) и ~150 MiB -
+~637 MiB ~170 MiB - вне аллокатора PyTorch (CUDA-контекст, модули кернелов, cuBLAS) и ~150 MiB -
 слоты весов слоя и буферы головы; выгрузки головы и входов слоёв зависят от PCIe (на Kaggle,
 ~13 ГБ/с, - в пределах разброса запусков, на ~6,3 ГБ/с - ~2,4 с и ~0,7 с), а `[gate | up]` на хосте выгоден
 только при быстрой шине (Kaggle -1,7..-2,6 с, Brev +~5 с); на хосте ~3,6 ГБ pinned-памяти.
