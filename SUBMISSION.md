@@ -10,7 +10,9 @@ backward тоже ждут на хосте (последние - вместо п
 
 ## Links
 - Repository, code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/7962b1d
-  (`solution_sha256` `522e22c0`; later commits change only the documentation)
+  (`solution_sha256` `522e22c0`). Since then `main` also has the fast exit (`9522c1b`, `bfff00c`) and
+  the late warm-up with NF4 loaded straight into pinned memory (`feca479`, `43765db`, `838827f`):
+  -1.8 s and -0.4..-0.9 s in Kaggle A/Bs; the official measurement of the current `main` will replace this
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   the README): https://www.kaggle.com/code/magurin/soup-kernel-challenge-opus-ultracode
   (TODO (заполняет команда): ссылка на сохранённую версию `?scriptVersionId=...` после финального
