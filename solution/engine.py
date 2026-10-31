@@ -199,20 +199,11 @@ class WeightStream:
                     for w in ws:
                         w.group = group
             self.layout.append((start, offset - start, entries, groups))
-        from . import hostload
-
-        arena = hostload.take_arena()
-        if arena is not None and arena.numel() == offset and all(
-                w.packed.data_ptr() == arena.data_ptr() + po
-                and w.absmax.data_ptr() == arena.data_ptr() + ao
-                for _, _, entries, _ in self.layout for w, po, _, ao, _ in entries):
-            self.host = arena  # the loader put every weight in its place here (solution/hostload)
-        else:
-            self.host = torch.empty((offset,), dtype=torch.uint8, pin_memory=True)
-            for _, _, entries, _ in self.layout:
-                for w, po, pn, ao, an in entries:
-                    self.host[po:po + pn].copy_(w.packed.reshape(-1).view(torch.uint8))
-                    self.host[ao:ao + an].copy_(w.absmax.reshape(-1).view(torch.uint8))
+        self.host = torch.empty((offset,), dtype=torch.uint8, pin_memory=True)
+        for _, _, entries, _ in self.layout:
+            for w, po, pn, ao, an in entries:
+                self.host[po:po + pn].copy_(w.packed.reshape(-1).view(torch.uint8))
+                self.host[ao:ao + an].copy_(w.absmax.reshape(-1).view(torch.uint8))
         torch.cuda.synchronize(device)
         # Free the device copies (the bitsandbytes parameters point at the host bytes meanwhile),
         # and only then take the three slots, so the peak never holds both.

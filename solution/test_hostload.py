@@ -14,7 +14,7 @@ def _load(tmp_path, host):
     from solution import hostload, warmup
 
     saved = (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
-             modeling_utils.convert_and_load_state_dict_in_model, warmup.fp16_path_gpu)
+             warmup.fp16_path_gpu)
     try:
         if host:
             warmup.fp16_path_gpu = lambda: True  # the T4 path, also on a bf16 GPU
@@ -22,7 +22,7 @@ def _load(tmp_path, host):
         return _tiny_model(tmp_path, dropout=0.1)
     finally:
         (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
-         modeling_utils.convert_and_load_state_dict_in_model, warmup.fp16_path_gpu) = saved
+         warmup.fp16_path_gpu) = saved
 
 
 def _linear4bit(model):
@@ -32,7 +32,6 @@ def _linear4bit(model):
 
 
 def test_host_load_same_step(tmp_path):
-    from solution import hostload
     from solution.engine import FusedQwen2
 
     torch.manual_seed(8)
@@ -57,13 +56,9 @@ def test_host_load_same_step(tmp_path):
         for p in params:
             p.data = (torch.randn(p.shape, generator=g) * 0.02).to(p.device, p.dtype)
         torch.cuda.manual_seed(2)  # the LoRA dropout masks (TorchDropout)
-        arena = hostload._PLAN[0]["buffer"] if host else None
-        assert (arena is not None and arena.is_pinned()) == host
         engine = FusedQwen2(model)
         assert engine.weights_on_host() == host
         engine.offload_weights()
-        # the loader put the weights where the WeightStream streams them from: no copy
-        assert (engine.stream.host is arena) == host
         loss, _, _ = engine.step(ids, mask, labels, 60.0)
         grads = torch.autograd.grad(loss, params)
         packed = [m.weight.data.clone() for m in modules]
@@ -101,8 +96,7 @@ def _load_to_host(tmp_path, dropout):
 
     cls = modeling_utils.PreTrainedModel
     saved = (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
-             cls.__dict__["_load_pretrained_model"],
-             modeling_utils.convert_and_load_state_dict_in_model, warmup.fp16_path_gpu)
+             cls.__dict__["_load_pretrained_model"], warmup.fp16_path_gpu)
     try:
         warmup.fp16_path_gpu = lambda: True  # the T4 path, also on a bf16 GPU
         hostload.patch_model_loading()
@@ -110,7 +104,7 @@ def _load_to_host(tmp_path, dropout):
         return _tiny_model(tmp_path, dropout=dropout)
     finally:
         (modeling_utils.caching_allocator_warmup, hf_bnb.Bnb4bitQuantize.convert,
-         loader, modeling_utils.convert_and_load_state_dict_in_model, warmup.fp16_path_gpu) = saved
+         loader, warmup.fp16_path_gpu) = saved
         cls._load_pretrained_model = loader
 
 
