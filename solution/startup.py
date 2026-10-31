@@ -13,7 +13,15 @@
   `--tracker`). While exactly those modules are imported, the availability check they bind
   reports the library as missing; the check is restored afterwards for everyone else. Nothing is
   stubbed: the libraries are simply not imported, as on a machine without them (organizers'
-  answer #622).
+  answer #622);
+- PyTorch gives every cuBLAS handle a workspace of 4 MiB x 2 + 16 KiB x 8 by default
+  (CUBLAS_WORKSPACE_CONFIG unset); with `:16:8` (the setting NVIDIA documents for deterministic
+  cuBLAS) a T4 run peaks 20 MiB lower in nvidia-smi at the same step time. cuBLAS then picks other
+  GEMM algorithms for some shapes, so the products round differently in the last bits (the loss
+  stays within the checks of the base, as with any GEMM). It must be set before the first cuBLAS
+  call of the process, which in a `soup train` run comes with the first training step (cuBLASLt
+  gets the same 128 KiB: CUBLASLT_WORKSPACE_SIZE, else it warns and is cut to it anyway). Allowed
+  by the organizers (t.me/souptasterschat/2880).
 """
 
 import contextlib
@@ -24,6 +32,19 @@ import sys
 
 def _log(message):
     print(f"[solution] {message}", file=sys.stderr, flush=True)
+
+
+# CUBLAS_WORKSPACE_CONFIG for this process unless the user set one; None: PyTorch's default
+CUBLAS_WORKSPACE = ":16:8"
+
+
+def small_cublas_workspace():
+    if CUBLAS_WORKSPACE is None or "CUBLAS_WORKSPACE_CONFIG" in os.environ:
+        return
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE
+    # cuBLASLt shares that workspace and would otherwise ask for 1 MiB, warn and get 128 KiB anyway
+    size, count = (int(x) for x in CUBLAS_WORKSPACE.strip(":").split(":"))
+    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", str(size * count))  # KiB
 
 
 def import_bitsandbytes():
