@@ -15,14 +15,19 @@ def _soup_map():
     return getattr(sft._map_text_sft_rows, "_soup_original", sft._map_text_sft_rows)
 
 
-def _ours():
+def _no_soup_map(*args, **kwargs):
+    raise AssertionError("went to Soup's map")
+
+
+def _ours(fallback=True):
+    """Our function; with fallback=False Soup's map behind it fails the test."""
     from soup_cli.trainer import sft
 
     from solution import dataprep
 
     saved = sft._map_text_sft_rows
     try:
-        sft._map_text_sft_rows = _soup_map()
+        sft._map_text_sft_rows = _soup_map() if fallback else _no_soup_map
         dataprep.patch_tokenization()
         return sft._map_text_sft_rows
     finally:
@@ -60,8 +65,8 @@ def test_same_dataset_as_soup(n):
 
     rows = _rows(n)
     kwargs = dict(format_row=_toy_format_row, split="train", max_length=512)
-    assert dataprep._formatted(rows, **kwargs) is not None  # our path, not Soup's map
-    _same(_ours()(rows, **kwargs), _soup_map()(rows, **kwargs))
+    assert dataprep._formatted(rows, **kwargs) is not None
+    _same(_ours(fallback=False)(rows, **kwargs), _soup_map()(rows, **kwargs))
 
 
 def test_same_error_as_soup():
@@ -69,7 +74,7 @@ def test_same_error_as_soup():
     rows[3]["messages"][1]["content"] = ""  # no causal-loss target left
     rows[3]["messages"][1]["role"] = "user"
     errors = []
-    for run in (_ours(), _soup_map()):
+    for run in (_ours(fallback=False), _soup_map()):
         with pytest.raises(ValueError) as info:
             run(rows, format_row=_toy_format_row, split="validation", max_length=512)
         errors.append((str(info.value), type(info.value.__cause__)))
@@ -130,4 +135,4 @@ def test_task_data_same_as_soup(train_file, tmp_path):
                         preserve_source_columns=task_preserves_source_columns(cfg.task))["train"]
     format_row = build_format_row(tokenizer=tokenizer, data_cfg=cfg.data, training_cfg=cfg.training)
     kwargs = dict(format_row=format_row, split="train", max_length=cfg.data.max_length)
-    _same(_ours()(rows, **kwargs), _soup_map()(rows, **kwargs))
+    _same(_ours(fallback=False)(rows, **kwargs), _soup_map()(rows, **kwargs))
