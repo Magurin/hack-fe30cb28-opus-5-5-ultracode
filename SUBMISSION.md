@@ -1,4 +1,4 @@
-# Submission: TODO (заполняет команда) название команды
+# Submission: Claude Opus 5.5 Ultracode
 
 Слитый шаг обучения Qwen2 + NF4 + LoRA на своих Triton-кернелах: без паддинга, с пересчётом слоя в
 backward. NF4-веса слоёв и эмбеддинг / `lm_head` с загрузки модели лежат в pinned-памяти CPU и
@@ -12,13 +12,13 @@ backward тоже ждут на хосте (последние - вместо п
 - Repository, final code = code of the measurement: https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/commit/838827f
   (`solution_sha256` `d39cd6cb`); `main` has the same code
 - Public Kaggle notebook of the official measurement (version 25, `838827f`: 1.860x / 30.98x, all 10 checks): https://www.kaggle.com/code/magurin/soup-kernel-run
-- Demo video (up to 3 minutes): TODO (заполняет команда)
+- Demo video (up to 3 minutes): https://drive.google.com/file/d/1yCVTZWKkWezRmAy1QiOQfeX5jgp11SAi/view
 - Presentation (PDF, 10 slides): https://github.com/BAITC-Hacks/hack-fe30cb28-opus-5-5-ultracode/blob/main/presentation/slides.pdf
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
-| TODO (заполняет команда) | | | | |
+| Столяров Игорь Дмитриевич | капитан, всё решение | [Magurin](https://github.com/Magurin) | [magurin](https://www.kaggle.com/magurin) | Telegram @magyrin |
 
 ## Our kernels
 Доля во времени обучения - как в проверке 4 (CUDA events harness, шаги 3-64); Kaggle T4, коммит
