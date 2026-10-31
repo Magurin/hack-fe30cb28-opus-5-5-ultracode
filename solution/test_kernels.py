@@ -110,9 +110,9 @@ def test_qkv_rope_forward_backward():
     group = HQ // HKV
     k = torch.empty(n, HQ, D, device=DEV, dtype=torch.float16)  # repeated for GQA
     v = torch.empty(n, HQ, D, device=DEV, dtype=torch.float16)
-    K.qkv_rope_fwd_kernel[(n,)](qkv, lq, qkv, lv, cos_t, sin_t, pos, q, k, v, 2.0, HQ=HQ,
+    K.qkv_rope_fwd_kernel[(n,)](qkv, lq, lv, cos_t, sin_t, pos, q, k, v, 2.0, HQ=HQ,
                                 HKV=HKV, D=D, BHQ=16, BHKV=2, GROUP=group, LORA_Q=True,
-                                LORA_K=False, LORA_V=True)
+                                LORA_V=True)
     cos = torch.cat([cos_t, cos_t], -1)[pos.long()][:, None, :]
     sin = torch.cat([sin_t, sin_t], -1)[pos.long()][:, None, :]
     qf = qkv[:, :HQ * D].float() + 2 * lq.float()
@@ -186,8 +186,16 @@ def test_lm_head_ce(V):
     close(work, grad, 1e-3)
 
 
+def _expand_kv(x, group):
+    """[tokens, HKV, D] -> [tokens, HKV * group, D], kv head j repeated group times (repeat_kv)."""
+    if group == 1:
+        return x
+    n, hkv, d = x.shape
+    return x[:, :, None, :].expand(n, hkv, group, d).reshape(n, hkv * group, d)
+
+
 def test_varlen_attention_matches_sdpa():
-    from solution.engine import _attn_bwd, _attn_fwd, _expand_kv
+    from solution.engine import _attn_bwd, _attn_fwd
 
     torch.manual_seed(0)
     lengths = [7, 130, 1, 64]

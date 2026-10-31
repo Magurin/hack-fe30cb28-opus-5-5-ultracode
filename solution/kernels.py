@@ -177,11 +177,11 @@ def rms_bwd_kernel(dy_ptr, tq_ptr, tv_ptr, x_ptr, rstd_ptr, w_ptr, dres_ptr, dx_
 # Qwen2 rotate_half: out[:half] = x1*cos - x2*sin, out[half:] = x2*cos + x1*sin.
 # --------------------------------------------------------------------------------------------
 @triton.jit
-def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lk_ptr, lv_ptr, cos_ptr, sin_ptr, pos_ptr,
+def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lv_ptr, cos_ptr, sin_ptr, pos_ptr,
                         q_ptr, k_ptr, v_ptr, lora_scale,
                         HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
                         BHQ: tl.constexpr, BHKV: tl.constexpr, GROUP: tl.constexpr,
-                        LORA_Q: tl.constexpr, LORA_K: tl.constexpr, LORA_V: tl.constexpr):
+                        LORA_Q: tl.constexpr, LORA_V: tl.constexpr):
     """k and v are written already repeated for grouped-query attention: [tokens, HQ, D], kv head
     j at heads j * GROUP .. j * GROUP + GROUP - 1 (what repeat_kv does), so the attention kernel
     reads them without a separate expand copy."""
@@ -212,10 +212,6 @@ def qkv_rope_fwd_kernel(qkv_ptr, lq_ptr, lk_ptr, lv_ptr, cos_ptr, sin_ptr, pos_p
     idx = hk * D + d[None, :]
     k1 = tl.load(row + HQ * D + idx, mask=mk, other=0.0).to(tl.float32)
     k2 = tl.load(row + HQ * D + idx + HALF, mask=mk, other=0.0).to(tl.float32)
-    if LORA_K:
-        lrow = lk_ptr + tok * (HKV * D)
-        k1 += tl.load(lrow + idx, mask=mk, other=0.0).to(tl.float32) * lora_scale
-        k2 += tl.load(lrow + idx + HALF, mask=mk, other=0.0).to(tl.float32) * lora_scale
     k1, k2 = (k1 * cos - k2 * sin).to(tl.float16), (k2 * cos + k1 * sin).to(tl.float16)
     for r in tl.static_range(GROUP):
         out = k_ptr + tok * (HQ * D) + (hk * GROUP + r) * D + d[None, :]

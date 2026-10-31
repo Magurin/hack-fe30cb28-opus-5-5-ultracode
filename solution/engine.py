@@ -169,7 +169,7 @@ class WeightStream:
               ("down_proj",))
 
     def __init__(self, specs, device):
-        self.specs, self.device = specs, device
+        self.device = device
         # per layer: (start, size, [[weight, packed off, n, absmax off, n]],
         #             [(group, packed off, n, absmax off, n)])
         self.layout = []
@@ -624,13 +624,6 @@ def _split_k_mm(a, b, parts, out=None):
     return out
 
 
-def _expand_kv(x, group):
-    if group == 1:
-        return x
-    n, hkv, d = x.shape
-    return x[:, :, None, :].expand(n, hkv, group, d).reshape(n, hkv * group, d)
-
-
 # ---------------------------------------------------------------------------------------------
 # One decoder layer
 # ---------------------------------------------------------------------------------------------
@@ -739,11 +732,10 @@ def _rope_fwd(spec, qkv, lq, lv, packed, lora_scale):
     v = torch.empty((n, spec.HQ, spec.D), device=dev, dtype=torch.float16)
     if n:
         _launch(K.qkv_rope_fwd_kernel, (n,),
-            qkv, lq if lq is not None else qkv, qkv, lv if lv is not None else qkv, packed.cos,
+            qkv, lq if lq is not None else qkv, lv if lv is not None else qkv, packed.cos,
             packed.sin, packed.pos, q, k, v, lora_scale, HQ=spec.HQ, HKV=spec.HKV, D=spec.D,
             BHQ=_pow2(spec.HQ), BHKV=_pow2(spec.HKV), GROUP=spec.HQ // spec.HKV,
-            LORA_Q=lq is not None, LORA_K=False,
-            LORA_V=lv is not None, num_warps=4)
+            LORA_Q=lq is not None, LORA_V=lv is not None, num_warps=4)
     return q, k, v
 
 
@@ -1256,8 +1248,6 @@ class FusedQwen2:
         causal = peft_model.get_base_model()
         inner = causal.model
         config = causal.config
-        self.peft_model = peft_model
-        self.config = config
         self.device = inner.norm.weight.device  # the embedding may be in host memory
         lora_names = _lora_targets(inner.layers[0])
         self.layers = [LayerSpec(layer, config, lora_names, i)
@@ -1463,13 +1453,12 @@ class FusedQwen2:
             self.stream.restore()
             self.stream = None
 
-    def step(self, input_ids, attention_mask, labels, denom, training=True):
+    def step(self, input_ids, attention_mask, labels, denom):
         """One training step's forward: (loss, packed, stats); autograd runs the backward. The
         InputStream and GuStream rings are allocated before the plan (keep_plan, lean), so the
         plan counts them; the streamed head fetches its first pieces HostHead.PREFETCH_LAYERS
         layers before the end of the forward."""
-        p = self.dropout_p if training else 0.0
-        packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, p)
+        packed = Packed(input_ids, attention_mask, labels, self.rope, self.rng, self.dropout_p)
         if self.lora_views:
             with torch.no_grad():
                 torch._foreach_copy_(self.lora_views, self.lora_fp32)
