@@ -2,7 +2,7 @@
 
     python presentation/make_slides.py        # needs only matplotlib
 
-Every number is the README's (Kaggle T4, commit aafb9a7, `run_task.py --repeats 2`, unless a slide
+Every number is the README's (Kaggle T4, commit 12029b6, `run_task.py --repeats 2`, unless a slide
 says otherwise). The team's name goes in TEAM below.
 """
 from pathlib import Path
@@ -74,7 +74,7 @@ def s1_title(fig):
     fig.text(0.05, 0.70, "Обучение Qwen2.5-1.5B (NF4 + LoRA) на Kaggle T4 на своих Triton-кернелах",
              fontsize=22, color=INK)
     fig.text(0.05, 0.64, f"Команда: {TEAM}", fontsize=16, color=MUTED)
-    for i, (big, small) in enumerate([("1,698x", "быстрее вся команда soup train\n(84,6 -> 49,8 с)"),
+    for i, (big, small) in enumerate([("1,713x", "быстрее вся команда soup train\n(82,7 -> 48,3 с)"),
                                       ("23,87x", "меньше пик памяти GPU\n(14 345 -> 601 MiB)"),
                                       ("10 / 10", "проверок check_rules.py,\neval loss -0,006%")]):
         x = 0.05 + i * 0.31
@@ -83,7 +83,7 @@ def s1_title(fig):
         fig.text(x + 0.02, 0.43, big, fontsize=40, weight="bold", color=ACCENT)
         fig.text(x + 0.02, 0.29, small, fontsize=14, color=INK, linespacing=1.4)
     para(fig, 0.05, 0.15, "Тот же адаптер на тех же батчах: модель, данные, LoRA, оптимизатор и выходы "
-             "Soup не меняются. Kaggle T4, --repeats 2, код aafb9a7.", 110, size=12, color=MUTED)
+             "Soup не меняются. Kaggle T4, --repeats 2, код 12029b6.", 110, size=12, color=MUTED)
 
 
 def s2_base(fig):
@@ -96,7 +96,7 @@ def s2_base(fig):
     ax.set_xlim(0, 12)
     ax.set_xlabel("ГБ на пике (порядок величины, разбор кода)")
     ax.set_title("Пик базы: 14 345 MiB (nvidia-smi)", fontsize=14, loc="left")
-    bullets(fig, ["База: soup train 84,6 с, из них цикл 64 шагов 62,8 с; пик 14 345 из 15 ГБ.",
+    bullets(fig, ["База: soup train 82,7 с, из них цикл 64 шагов 61,3 с; пик 14 345 из 15 ГБ.",
                   "bitsandbytes возвращает выход каждой проекции в fp32: gate/up MLP (токены x 8 960) "
                   "хранятся для backward в fp32.",
                   "peft поднимает эмбеддинг / lm_head (151 936 x 1 536) в fp32.",
@@ -142,14 +142,14 @@ def s3_idea(fig):
 
 def s4_kernels(fig):
     ax = fig.add_axes([0.17, 0.16, 0.36, 0.62])
-    k = [("nf4_dequant", 7.8), ("rms_fwd", 2.7), ("glu_bwd", 2.0), ("rms_bwd", 1.3), ("glu_fwd", 1.1),
-         ("qkv_rope_fwd", 0.88), ("lm_head_piece", 0.70), ("qkv_rope_bwd", 0.34), ("lm_head_finish", 0.01)]
+    k = [("nf4_dequant", 7.8), ("rms_fwd", 2.7), ("glu_bwd", 2.1), ("rms_bwd", 1.3), ("glu_fwd", 1.2),
+         ("qkv_rope_fwd", 0.90), ("lm_head_piece", 0.71), ("qkv_rope_bwd", 0.35), ("lm_head_finish", 0.01)]
     ax.barh([n for n, _ in k][::-1], [v for _, v in k][::-1], color=ACCENT)
     for i, (_, v) in enumerate(k[::-1]):
         ax.text(v + 0.1, i, f"{ru(v, 2 if v < 1 else 1)}%", va="center", fontsize=12)
     ax.set_xlim(0, 9.5)
     ax.set_xlabel("доля времени обучения (проверка 4, шаги 3-64)")
-    ax.set_title("Наши кернелы: вместе 16,8% (порог 5%)", fontsize=14, loc="left")
+    ax.set_title("Наши кернелы: вместе 17,0% (порог 5%)", fontsize=14, loc="left")
     bullets(fig, ["Ни одного tl.dot; пример шаблона удалён.",
                   "rms_fwd за один проход: residual add, RMSNorm в fp32, каст в fp16 и входы обеих "
                   "LoRA с dropout; маска - функция seed и позиции, в backward генерируется заново.",
@@ -228,9 +228,9 @@ def s7_waterfall(fig):
 
 def s8_results(fig):
     rows = [("", "База", "Решение", "Отношение"),
-            ("soup train, с", "84,6", "49,8", "1,698x"),
-            ("цикл 64 шагов, с", "62,8", "29,9", "2,10x"),
-            ("медиана шага, с", "0,981", "0,413", "2,3x"),
+            ("soup train, с", "82,7", "48,3", "1,713x"),
+            ("цикл 64 шагов, с", "61,3", "28,8", "2,13x"),
+            ("медиана шага, с", "0,972", "0,393", "2,4x"),
             ("пик GPU, MiB", "14 345", "601", "23,87x"),
             ("eval loss", "2,04965", "2,04953", "-0,006%"),
             ("проверки", "", "", "10 / 10")]
@@ -239,15 +239,15 @@ def s8_results(fig):
         for j, cell in enumerate(row):
             fig.text(0.05 + [0, 0.17, 0.27, 0.37][j], y, cell, fontsize=14,
                      weight="bold" if i == 0 or j == 3 else None, color=ACCENT if j == 3 and i else INK)
-    fig.text(0.05, 0.30, "Kaggle T4, --repeats 2 (база, решение, решение, база), aafb9a7;\n"
-             "медиана - запуск 1. Сессии Kaggle различаются (база 79-88 с):\nнаши r2 - 1,598-1,712x, последние три - 1,698-1,712x.",
+    fig.text(0.05, 0.30, "Kaggle T4, --repeats 2 (база, решение, решение, база), 12029b6;\n"
+             "медиана - запуск 1. Сессии Kaggle различаются (база 79-88 с):\nнаши r2 - 1,598-1,713x, последние четыре - 1,698-1,713x.",
              fontsize=12, color=MUTED, linespacing=1.4, va="top")
     para(fig, 0.05, 0.17, "Срезы, похожие на скрытые (Brev T4): 10/10 проверок; со стеком CUDA пик "
          "579-599 MiB; на батчах 4 x 512 база падает с OOM, решение - 573 MiB.", 62, size=12)
     ax = fig.add_axes([0.56, 0.20, 0.38, 0.52])
-    versions = [3, 4, 5, "6-8", 9, 10, 11, 12, 13, 14, 15]
-    s = [1.42, 1.53, 1.57, 1.56, 1.60, 1.61, 1.624, 1.628, 1.705, 1.712, 1.698]
-    m = [11.25, 11.25, 11.23, 11.23, 11.23, 11.23, 17.64, 22.59, 22.45, 22.45, 23.87]
+    versions = [3, 4, 5, "6-8", 9, 10, 11, 12, 13, 14, 15, 16]
+    s = [1.42, 1.53, 1.57, 1.56, 1.60, 1.61, 1.624, 1.628, 1.705, 1.712, 1.698, 1.713]
+    m = [11.25, 11.25, 11.23, 11.23, 11.23, 11.23, 17.64, 22.59, 22.45, 22.45, 23.87, 23.87]
     xs = range(len(versions))
     ax.plot(xs, s, marker="o", color=ACCENT, lw=2)
     ax.set_ylabel("speedup s (r2)", color=ACCENT)
@@ -260,8 +260,8 @@ def s8_results(fig):
     ax.set_xticks(list(xs), [str(v) for v in versions])
     ax.set_xlabel("версия (история версий в README)")
     ax.set_title("Kaggle T4 по версиям: s и m", fontsize=14, loc="left")
-    ax.text(10, 1.698 + 0.02, "1,698", ha="center", color=ACCENT, fontsize=11)
-    ax2.text(10, 23.87 + 0.9, "23,87", ha="center", color=MUTED, fontsize=11)
+    ax.text(11, 1.713 + 0.02, "1,713", ha="center", color=ACCENT, fontsize=11)
+    ax2.text(11, 23.87 + 0.9, "23,87", ha="center", color=MUTED, fontsize=11)
 
 
 def s9_failed(fig):
@@ -291,7 +291,7 @@ def s10_limits(fig):
     ax.set_xlabel("частота SM под нагрузкой, МГц")
     ax.set_title("T4 на Kaggle - всегда в пределе 70 Вт", fontsize=13, loc="left")
     fig.text(0.62, 0.13, "Внутри запуска решения ~860 -> ~750 МГц,\nот запуска к запуску цикл 26,75 -> 28,22 с;\n"
-             "r2 одним ноутбуком - от 1,598x до 1,712x.", fontsize=11, color=MUTED, linespacing=1.4)
+             "r2 одним ноутбуком - от 1,598x до 1,713x.", fontsize=11, color=MUTED, linespacing=1.4)
     y = bullets(fig, ["Заточено под Qwen2 + NF4 + LoRA на q/v в fp16 (T4); остальное - исходный код Soup.",
                       "GEMM ~69% работы GPU и упираются в cuBLAS; вне цикла (~20 с) наш выигрыш ~7 с.",
                       "Выгрузки зависят от PCIe: на Kaggle (~13 ГБ/с) голова и входы - в пределах разброса, "
